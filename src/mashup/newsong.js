@@ -1,66 +1,123 @@
 // "Neuer Song": instead of putting whole parts of songs one after another, every song is split into layers
 // (drums, bass, music, air) and the layers of different songs play *together* in a fresh arrangement.
+// A suggestion is a set of editable params (style, which song/part feeds each layer, levels, pumping,
+// energy, FX); buildNewSong turns params into clips, so every slider change rebuilds the song instantly.
 import { camelotDistance, keyName } from './keys.js'
 
-// Which loops we cut from each song. Each region yields all four layers.
 export const REGION_TYPES = ['drop', 'break', 'groove']
+export const REGION_LABELS = { drop: 'Drop', break: 'Break', groove: 'Groove' }
 
-// Musical roles in the new song and where they come from.
+// Musical roles in the new song: which stem they use and their default source part.
 export const ROLES = [
-  { key: 'drums', label: 'Drums', region: 'drop', stem: 'drums', color: '#f43f5e' },
-  { key: 'bass', label: 'Bass', region: 'drop', stem: 'bass', color: '#a855f7' },
-  { key: 'hook', label: 'Hook', region: 'drop', stem: 'music', color: '#22d3ee' },
-  { key: 'pad', label: 'Flächen / Vocals', region: 'break', stem: 'music', color: '#a3e635' },
-  { key: 'air', label: 'Atmo', region: 'drop', stem: 'air', color: '#facc15' },
-  { key: 'intro', label: 'Intro-Drums', region: 'groove', stem: 'drums', color: '#fb923c' },
+  { key: 'intro', label: 'Intro-Drums', stem: 'drums', region: 'groove' },
+  { key: 'drums', label: 'Drums', stem: 'drums', region: 'drop' },
+  { key: 'bass', label: 'Bass', stem: 'bass', region: 'drop' },
+  { key: 'hook', label: 'Hook', stem: 'music', region: 'drop' },
+  { key: 'pad', label: 'Flächen / Vocals', stem: 'music', region: 'break' },
+  { key: 'air', label: 'Atmo', stem: 'air', region: 'drop' },
 ]
+const roleOf = (key) => ROLES.find((r) => r.key === key)
 
-const LEVEL = { drums: 0.16, bass: 0.13, hook: 0.09, pad: 0.08, air: 0.035, intro: 0.13 } // target RMS per role
+// target RMS per role, a little under full scale so the master limiter is not squashing everything
+const LEVEL = { drums: 0.14, intro: 0.12, bass: 0.11, hook: 0.075, pad: 0.065, air: 0.028 }
+// how strongly each role pumps against the kick (times the style's pump amount)
+const DUCK = { bass: 1, pad: 1, hook: 0.6, air: 0.5 }
 
-// Arrangement templates: [name, bars, { role: gain }, fx]
-const S = (name, bars, layers, fx = {}) => ({ name, bars, layers, fx })
-export const TEMPLATES = {
-  kurz: [
-    S('Intro', 8, { intro: 1, air: 1 }, { fadeIn: 4 }),
-    S('Build-up', 8, { pad: 1, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
-    S('Break', 8, { pad: 1, air: 1 }),
-    S('Build-up', 8, { pad: 1, hook: 0.5, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 16, { drums: 1, bass: 1, hook: 1, pad: 0.45, air: 1 }, { impact: true }),
-    S('Outro', 8, { drums: 1, air: 1 }, { fadeOut: 8 }),
-  ],
-  mittel: [
-    S('Intro', 16, { intro: 1, air: 1 }, { fadeIn: 4 }),
-    S('Strophe', 16, { drums: 1, bass: 1, pad: 0.6, air: 1 }),
-    S('Build-up', 8, { pad: 1, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
-    S('Break', 16, { pad: 1, air: 1 }),
-    S('Build-up', 8, { pad: 1, hook: 0.5, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 16, { drums: 1, bass: 1, hook: 1, pad: 0.45, air: 1 }, { impact: true }),
-    S('Outro', 16, { drums: 1, air: 1 }, { fadeOut: 8 }),
-  ],
-  lang: [
-    S('Intro', 16, { intro: 1, air: 1 }, { fadeIn: 4 }),
-    S('Strophe', 16, { drums: 1, bass: 1, pad: 0.6, air: 1 }),
-    S('Build-up', 8, { pad: 1, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 32, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
-    S('Break', 16, { pad: 1, air: 1 }),
-    S('Build-up', 8, { pad: 1, hook: 0.5, drums: 0.8 }, { sweep: true, riser: true }),
-    S('Drop', 32, { drums: 1, bass: 1, hook: 1, pad: 0.45, air: 1 }, { impact: true }),
-    S('Strophe', 16, { drums: 1, bass: 1, air: 1 }),
-    S('Outro', 16, { drums: 1, air: 1 }, { fadeOut: 8 }),
-  ],
-}
-
+// Each layer gets its own space in the spectrum, otherwise stacked songs turn to mud in the low mids.
 export const TRACKS = [
-  { id: 'ns-drums', name: 'Drums', color: '#f43f5e', roles: ['drums', 'intro'] },
-  { id: 'ns-bass', name: 'Bass', color: '#a855f7', roles: ['bass'] },
-  { id: 'ns-hook', name: 'Hook', color: '#22d3ee', roles: ['hook'] },
-  { id: 'ns-pad', name: 'Flächen / Vocals', color: '#a3e635', roles: ['pad'] },
-  { id: 'ns-air', name: 'Atmo', color: '#facc15', roles: ['air'] },
-  { id: 'ns-fx', name: 'FX (Riser)', color: '#94a3b8', roles: [] },
+  { id: 'ns-drums', name: 'Drums', color: '#f43f5e', roles: ['drums', 'intro'], fx: {} },
+  { id: 'ns-bass', name: 'Bass', color: '#a855f7', roles: ['bass'], fx: { lp: 320 } },
+  { id: 'ns-hook', name: 'Hook', color: '#22d3ee', roles: ['hook'], fx: { hp: 180, eqMid: -1 } },
+  { id: 'ns-pad', name: 'Flächen / Vocals', color: '#a3e635', roles: ['pad'], fx: { hp: 280, eqMid: -2, eqHigh: 1 } },
+  { id: 'ns-air', name: 'Atmo', color: '#facc15', roles: ['air'], fx: { hp: 4500 } },
+  { id: 'ns-fx', name: 'FX (Riser)', color: '#94a3b8', roles: [], fx: { hp: 60 } },
 ]
 const trackFor = (role) => TRACKS.find((t) => t.roles.includes(role)).id
+
+const S = (name, bars, layers, fx = {}) => ({ name, bars, layers, fx })
+
+export const STYLES = {
+  club: {
+    name: 'Club-Track',
+    blurb: 'Klassischer House-Aufbau: Groove, Build-up mit Riser, zwei Drops.',
+    pump: 0.35,
+    sections: [
+      S('Intro', 16, { intro: 1, air: 0.8 }, { fadeIn: 4 }),
+      S('Strophe', 16, { drums: 1, bass: 1, pad: 0.55, air: 0.8 }),
+      S('Build-up', 8, { pad: 1, drums: 0.75 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
+      S('Break', 16, { pad: 1, air: 1 }),
+      S('Build-up', 8, { pad: 0.8, hook: 0.5, drums: 0.75 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
+      S('Outro', 16, { drums: 1, air: 0.8 }, { fadeOut: 8 }),
+    ],
+  },
+  deep: {
+    name: 'Deep & Groovy',
+    blurb: 'Weniger Effekte, mehr Groove: lange Bass-Passagen, starkes Pumpen, kein Riser.',
+    pump: 0.55,
+    sections: [
+      S('Intro', 16, { intro: 1 }, { fadeIn: 4 }),
+      S('Groove', 16, { intro: 1, bass: 0.9 }),
+      S('Strophe', 16, { drums: 1, bass: 1, pad: 0.7 }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 0.85, air: 0.6 }),
+      S('Break', 8, { pad: 1, bass: 0.6, intro: 0.5 }, { sweep: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 0.9, pad: 0.4 }),
+      S('Outro', 16, { intro: 1, bass: 0.6 }, { fadeOut: 8 }),
+    ],
+  },
+  festival: {
+    name: 'Festival',
+    blurb: 'Große Builds, Hook schon im Break, ein dritter Drop zum Schluss.',
+    pump: 0.3,
+    sections: [
+      S('Intro', 8, { intro: 1, air: 1, hook: 0.3 }, { fadeIn: 4 }),
+      S('Build-up', 8, { pad: 0.8, drums: 0.8 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
+      S('Break', 16, { pad: 1, hook: 0.6, air: 1 }),
+      S('Build-up', 8, { hook: 0.7, pad: 0.6, drums: 0.8 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1 }, { impact: true }),
+      S('Build-up', 8, { hook: 0.6, drums: 0.8 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, hook: 1, air: 1, pad: 0.35 }, { impact: true }),
+      S('Outro', 8, { drums: 1, air: 1 }, { fadeOut: 8 }),
+    ],
+  },
+  vocal: {
+    name: 'Vocal-Fokus',
+    blurb: 'Flächen und Gesang stehen vorne, die Hook bleibt im Hintergrund.',
+    pump: 0.4,
+    sections: [
+      S('Intro', 16, { intro: 1, pad: 0.5 }, { fadeIn: 4 }),
+      S('Strophe', 16, { drums: 1, bass: 0.9, pad: 1 }),
+      S('Build-up', 8, { pad: 1, drums: 0.7 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, pad: 1, hook: 0.5, air: 0.8 }, { impact: true }),
+      S('Break', 16, { pad: 1, air: 1 }),
+      S('Build-up', 8, { pad: 1, drums: 0.7 }, { sweep: true, riser: true }),
+      S('Drop', 16, { drums: 1, bass: 1, pad: 1, hook: 0.6, air: 0.8 }, { impact: true }),
+      S('Outro', 16, { drums: 1, pad: 0.5 }, { fadeOut: 8 }),
+    ],
+  },
+}
+
+export const LENGTH_NAMES = ['kurz', 'mittel', 'lang']
+
+// Same style in three lengths: kurz trims the calm parts, lang doubles the drops and adds a groove.
+export function sectionsFor(style, length) {
+  const base = STYLES[style].sections
+  if (length === 'kurz') {
+    return base
+      .filter((s, i) => !(s.name === 'Strophe' && i > 1) && s.name !== 'Groove')
+      .map((s) => ({ ...s, bars: s.name === 'Drop' || s.name === 'Build-up' ? s.bars : Math.min(8, s.bars) }))
+  }
+  if (length === 'lang') {
+    const out = base.map((s) => (s.name === 'Drop' ? { ...s, bars: 32 } : s))
+    out.splice(out.length - 1, 0, S('Groove', 16, { drums: 1, bass: 1, air: 0.8 }))
+    return out
+  }
+  return base
+}
+
+export const sectionBars = (style, length) => sectionsFor(style, length).reduce((a, s) => a + s.bars, 0)
 
 // Picks the loop regions (in the song's own time) for one analysed song.
 export function pickRegions(song) {
@@ -94,108 +151,170 @@ function mulberry32(seed) {
   }
 }
 
-// library: songId -> { drop: { drums, bass, music, air }, break: {...}, groove: {...} }, each { bufferId, rms, present, bars, label }
+// library: songId -> { drop: { drums, bass, music, air }, break: {...}, groove: {...} }; each stem { bufferId, rms, present, bars, energy }
+export function stemFor(library, role, source) {
+  if (!source) return null
+  return library.get(source.song)?.[source.region]?.[roleOf(role).stem] ?? null
+}
+
+// All sources a role can use (for the UI and the suggestion search).
+export function sourcesFor(library, plan, role) {
+  const out = []
+  for (const song of plan) {
+    for (const region of REGION_TYPES) {
+      const st = stemFor(library, role, { song: song.id, region })
+      if (st?.present && !out.some((o) => o.stem.bufferId === st.bufferId)) out.push({ song: song.id, region, stem: st })
+    }
+  }
+  return out
+}
+
+export function defaultParams(style) {
+  return { style, sources: {}, levels: Object.fromEntries(ROLES.map((r) => [r.key, 1])), pump: STYLES[style].pump, energy: 0.5, riser: true, sweeps: true }
+}
+
 export function suggestNewSongs(plan, library, { seed = 1 } = {}) {
   const rnd = mulberry32(seed * 104729 + 7)
-  const jitter = seed > 1 ? 0.5 : 0.02
+  const jitter = seed > 1 ? 0.45 : 0.02
   const songs = plan.filter((s) => library.has(s.id))
   if (!songs.length) return []
-  const layer = (song, role) => {
-    const r = ROLES.find((x) => x.key === role)
-    const lib = library.get(song.id)
-    return lib[r.region]?.[r.stem]
-  }
+  const songOf = (id) => songs.find((s) => s.id === id)
+  const opts = Object.fromEntries(ROLES.map((r) => [r.key, sourcesFor(library, songs, r.key)]))
+  if (!opts.drums.length || !opts.hook.length) return []
+
+  const dropBass = opts.bass.filter((o) => o.region === 'drop')
+  const bassOpts = dropBass.length ? dropBass : opts.bass.length ? opts.bass : [null]
+  // every combination of drums / bass / hook / pad sources, scored for how well they fit together
   const combos = []
-  const ids = songs.map((s) => s)
-  for (const drums of ids)
-    for (const bass of ids)
-      for (const hook of ids)
-        for (const pad of ids) {
-          const pick = { drums, bass, hook, pad, air: hook, intro: drums }
-          if (!['drums', 'bass', 'hook'].every((r) => layer(pick[r], r)?.present)) continue
-          if (!layer(pad, 'pad')?.present) pick.pad = hook
-          const used = new Set(Object.values(pick).map((s) => s.id))
+  for (const drums of opts.drums.filter((o) => o.region !== 'break'))
+    for (const bass of bassOpts)
+      for (const hook of opts.hook)
+        for (const pad of opts.pad.length ? opts.pad : [null]) {
+          if (pad && pad.stem.bufferId === hook.stem.bufferId) continue
+          const s = (o) => (o ? songOf(o.song) : null)
+          const used = new Set([drums, bass, hook, pad].filter(Boolean).map((o) => o.song))
           let score = 0
-          const notes = []
-          if (songs.length > 1 && used.size === 1) score -= 1.2 // that's just the original song
+          if (songs.length > 1 && used.size === 1) score -= 1.2 // that's just the original song again
           score += 0.25 * (used.size - 1)
-          // harmony: bass, hook and pads must agree after the pitch shift
-          const dBH = camelotDistance(pick.bass.key, pick.hook.key)
-          const dHP = camelotDistance(pick.hook.key, pick.pad.key)
-          score += pick.bass === pick.hook ? 0.35 : dBH === 0 ? 0.25 : dBH === 1 ? 0.05 : -0.8
-          score += pick.hook === pick.pad ? 0.15 : dHP === 0 ? 0.12 : dHP === 1 ? 0 : -0.6
-          // groove: drums and bass from different songs are the classic "new song" move, but bass needs room
-          if (pick.drums !== pick.bass) score += 0.1
-          score += 0.3 * layer(pick.hook, 'hook').energy + 0.15 * layer(pick.drums, 'drums').energy
-          for (const s of used) score -= Math.abs(songs.find((x) => x.id === s).tempo - 1) * 1.5
-          score += jitter * rnd()
-          combos.push({ pick, score, used, dBH, dHP, notes })
+          if (bass) {
+            const d = camelotDistance(s(bass).key, s(hook).key)
+            score += bass.song === hook.song ? 0.35 : d === 0 ? 0.25 : d === 1 ? 0.05 : -0.9
+          }
+          if (pad) {
+            const d = camelotDistance(s(pad).key, s(hook).key)
+            score += pad.song === hook.song ? 0.15 : d === 0 ? 0.12 : d === 1 ? 0 : -0.7
+          }
+          if (bass && drums.song !== bass.song) score += 0.1
+          score += 0.3 * hook.stem.energy + 0.15 * drums.stem.energy
+          if (hook.region !== 'drop') score -= 0.1
+          for (const id of used) score -= Math.abs(songOf(id).tempo - 1) * 1.5
+          combos.push({ drums, bass, hook, pad, used, score })
         }
-  combos.sort((a, b) => b.score - a.score)
-  // keep variety: no two suggestions with the same drums + hook source
-  const out = []
-  for (const c of combos) {
-    if (out.some((o) => o.pick.drums === c.pick.drums && o.pick.hook === c.pick.hook)) continue
-    out.push(c)
-    if (out.length >= 4) break
+
+  // each style looks for a different kind of combination, so the suggestions really differ
+  const styleBonus = {
+    club: () => 0,
+    deep: (c) => (c.bass && c.drums.song === c.bass.song ? 0.25 : 0) - 0.15 * c.hook.stem.energy,
+    festival: (c) => 0.4 * c.hook.stem.energy + 0.1 * c.drums.stem.energy,
+    vocal: (c) => (c.pad ? 0.3 + (c.pad.song !== c.drums.song ? 0.15 : 0) : -1),
   }
-  const maxScore = Math.max(...out.map((c) => c.score), 1)
-  return out.map((c, i) => describe(c, songs.length, i, maxScore))
-}
-
-function describe(c, songCount, i, maxScore) {
-  const { pick } = c
-  const L = (s) => s.letter
-  const title =
-    pick.drums === pick.hook && pick.bass === pick.hook
-      ? `Re-Edit von ${L(pick.hook)}`
-      : pick.drums === pick.bass
-        ? `Groove von ${L(pick.drums)} + Hook von ${L(pick.hook)}`
-        : pick.bass === pick.hook
-          ? `Beat von ${L(pick.drums)} + Bass & Hook von ${L(pick.hook)}`
-          : `Beat ${L(pick.drums)} · Bass ${L(pick.bass)} · Hook ${L(pick.hook)}`
-  const notes = [
-    `Drums aus dem Drop von ${L(pick.drums)}, im Intro ein ruhigerer Groove aus demselben Song.`,
-    pick.bass === pick.hook
-      ? `Bass und Hook beide aus ${L(pick.hook)}, harmonisch sicher (${keyName(pick.hook.key)}).`
-      : `Bass aus ${L(pick.bass)} (${keyName(pick.bass.key)}) unter der Hook von ${L(pick.hook)} (${keyName(pick.hook.key)})${c.dBH <= 1 ? ', passt zusammen' : ', tonal gewagt'}.`,
-    pick.pad === pick.hook ? `Flächen im Break aus ${L(pick.pad)}.` : `Flächen und Vocals im Break kommen aus ${L(pick.pad)}.`,
-  ]
-  if (songCount > 1 && c.used.size === 1) notes.push('Nutzt nur einen Song, klingt eher wie ein Re-Edit.')
-  const score = Math.round(Math.min(99, Math.max(30, 60 + 39 * (c.score / maxScore))))
-  return { key: `ns-${i}-${Object.values(pick).map((s) => s.id).join('')}`, title, notes, pick, score, songs: [...c.used] }
-}
-
-// Clips for one suggestion. extras: { riserId, impactId } procedurally generated FX buffers.
-export function buildNewSong(sug, library, { targetBpm, length = 'mittel', makeId, extras }) {
-  const barLen = 240 / targetBpm
-  const clips = []
-  const template = TEMPLATES[length]
-  let bar = 0
-  const sections = []
-  for (const sec of template) {
-    sections.push({ name: sec.name, start: bar, bars: sec.bars, layers: Object.keys(sec.layers) })
-    for (const [role, gain] of Object.entries(sec.layers)) {
-      const r = ROLES.find((x) => x.key === role)
-      let song = sug.pick[role]
-      let lib = library.get(song.id)?.[r.region]?.[r.stem]
-      if (!lib?.present && role === 'intro') {
-        song = sug.pick.drums
-        lib = library.get(song.id).drop.drums
+  const order = Object.keys(STYLES)
+  if (seed > 1) order.sort(() => rnd() - 0.5)
+  const taken = []
+  const out = []
+  for (const style of order) {
+    let best = null
+    let bestScore = -Infinity
+    for (const c of combos) {
+      let sc = c.score + styleBonus[style](c) + jitter * rnd()
+      // penalise repeating a combination another suggestion already uses
+      for (const t of taken) {
+        if (t.drums === c.drums && t.hook === c.hook) sc -= 0.8
+        else if (t.hook === c.hook || t.drums === c.drums) sc -= 0.25
       }
-      if (!lib?.present) continue
-      const level = Math.min(4, LEVEL[role] / Math.max(1e-4, lib.rms)) * gain
-      const loopBars = lib.bars
-      for (let b = 0; b < sec.bars; b += loopBars) {
-        const bars = Math.min(loopBars, sec.bars - b)
-        const first = b === 0
-        const last = b + loopBars >= sec.bars
+      if (sc > bestScore) {
+        bestScore = sc
+        best = c
+      }
+    }
+    if (!best) continue
+    taken.push(best)
+    const params = defaultParams(style)
+    const intro = opts.intro.find((o) => o.song === best.drums.song && o.region === 'groove') ?? best.drums
+    const air = opts.air.find((o) => o.song === best.hook.song) ?? opts.air[0] ?? null
+    params.sources = { drums: best.drums, intro, bass: best.bass, hook: best.hook, pad: best.pad, air }
+    out.push({ key: `ns-${style}-${seed}`, params, baseScore: bestScore })
+  }
+  const max = Math.max(...out.map((o) => o.baseScore), 0.01)
+  return out.map((o) => ({ ...o, score: Math.round(Math.min(99, Math.max(30, 62 + 37 * (o.baseScore / max)))) }))
+}
+
+// Title and explanation for the current params (recomputed after every slider change).
+export function describeParams(params, plan) {
+  const st = STYLES[params.style]
+  const src = params.sources
+  const song = (o) => (o ? plan.find((s) => s.id === o.song) : null)
+  const L = (o) => song(o)?.letter ?? '–'
+  const part = (o) => (o ? `${L(o)} (${REGION_LABELS[o.region]})` : 'aus')
+  let title
+  if (src.bass && src.drums.song === src.bass.song && src.drums.song === src.hook.song) {
+    title = src.pad && src.pad.song !== src.hook.song ? `${L(src.hook)} mit Flächen/Vocals von ${L(src.pad)}` : `Re-Edit von ${L(src.hook)}`
+  }
+  else if (src.bass && src.drums.song === src.bass.song) title = `Groove von ${L(src.drums)} + Hook von ${L(src.hook)}`
+  else if (src.bass && src.bass.song === src.hook.song) title = `Beat von ${L(src.drums)} + Bass & Hook von ${L(src.hook)}`
+  else title = `Beat ${L(src.drums)} · Bass ${L(src.bass)} · Hook ${L(src.hook)}`
+  const notes = [st.blurb, `Drums ${part(src.drums)} · Bass ${part(src.bass)} · Hook ${part(src.hook)} · Flächen ${part(src.pad)}.`]
+  const hk = song(src.hook)
+  if (src.bass && hk) {
+    const bs = song(src.bass)
+    const d = camelotDistance(bs.key, hk.key)
+    notes.push(
+      bs === hk
+        ? `Bass und Hook aus demselben Song, harmonisch sicher (${keyName(hk.key)}).`
+        : `Bass in ${keyName(bs.key)} unter Hook in ${keyName(hk.key)}: ${d <= 1 ? 'passt zusammen' : 'tonal gewagt'}.`,
+    )
+  }
+  if (params.pump > 0.05) notes.push(`Sidechain-Pumpen ${Math.round(params.pump * 100)} %: Bass und Flächen machen Platz für die Kick.`)
+  return { title: `${st.name}: ${title}`, notes }
+}
+
+// Clips for one set of params. extras: { riserId, impactId } procedurally generated FX buffers.
+export function buildNewSong(params, library, { targetBpm, length = 'mittel', makeId, extras, letters = new Map() }) {
+  const barLen = 240 / targetBpm
+  const beat = barLen / 4
+  const e = params.energy
+  const clips = []
+  const sections = []
+  let bar = 0
+  for (const sec of sectionsFor(params.style, length)) {
+    const layers = { ...sec.layers }
+    // energy: more layers and air when high, a sparser groove when low
+    if (sec.name === 'Strophe' || sec.name === 'Groove') {
+      if (e > 0.65) layers.hook = Math.max(layers.hook ?? 0, (e - 0.65) * 1.6)
+      if (e < 0.3) delete layers.bass
+    }
+    if (layers.air) layers.air *= 0.6 + 0.8 * e
+    const hasKick = layers.drums || layers.intro
+    sections.push({ name: sec.name, start: bar, bars: sec.bars, layers: Object.keys(layers) })
+    for (const [role, sectionGain] of Object.entries(layers)) {
+      let stem = stemFor(library, role, params.sources[role])
+      let source = params.sources[role]
+      if (!stem?.present && role === 'intro') {
+        source = params.sources.drums
+        stem = stemFor(library, 'drums', source)
+      }
+      const gain = sectionGain * (params.levels[role] ?? 1)
+      if (!stem?.present || gain <= 0.01) continue
+      const level = Math.min(4, LEVEL[role] / Math.max(1e-4, stem.rms)) * gain
+      const pump = hasKick && DUCK[role] ? params.pump * DUCK[role] : 0
+      for (let b = 0; b < sec.bars; b += stem.bars) {
+        const bars = Math.min(stem.bars, sec.bars - b)
         const len = bars * barLen
         const clip = {
           id: makeId(),
           trackId: trackFor(role),
-          bufferId: lib.bufferId,
-          name: `${song.letter} · ${r.label}`,
+          bufferId: stem.bufferId,
+          name: `${letters.get(source.song) ?? ''} · ${roleOf(role).label}`,
           start: (bar + b) * barLen,
           offset: 0,
           length: len,
@@ -205,20 +324,21 @@ export function buildNewSong(sug, library, { targetBpm, length = 'mittel', makeI
           fadeOut: 0,
           inFx: null,
           outFx: null,
-          songId: song.id,
+          duck: pump > 0 ? { amount: Math.min(0.85, pump), beat } : null,
+          songId: source.song,
           role,
         }
-        if (first && sec.fx.fadeIn) clip.fadeIn = Math.min(len, sec.fx.fadeIn * barLen)
-        if (sec.fx.fadeOut && last) clip.fadeOut = Math.min(len, sec.fx.fadeOut * barLen)
-        if (sec.fx.sweep && role === 'drums' && last) clip.outFx = { type: 'hp', len }
+        if (b === 0 && sec.fx.fadeIn) clip.fadeIn = Math.min(len, sec.fx.fadeIn * barLen)
+        if (sec.fx.fadeOut && b + stem.bars >= sec.bars) clip.fadeOut = Math.min(len, sec.fx.fadeOut * barLen)
+        if (params.sweeps && sec.fx.sweep && (role === 'drums' || role === 'intro') && b + stem.bars >= sec.bars) clip.outFx = { type: 'hp', len }
         clips.push(clip)
       }
     }
-    if (sec.fx.riser && extras?.riserId) {
-      clips.push(fxClip(makeId, extras.riserId, 'Riser', (bar + sec.bars - 8) * barLen, 8 * barLen, 0.9))
+    if (params.riser && sec.fx.riser && extras?.riserId) {
+      clips.push(fxClip(makeId, extras.riserId, 'Riser', (bar + sec.bars - 8) * barLen, 8 * barLen, 0.5 + 0.6 * e))
     }
-    if (sec.fx.impact && extras?.impactId) {
-      clips.push(fxClip(makeId, extras.impactId, 'Impact', bar * barLen, 2 * barLen, 0.9))
+    if (params.riser && sec.fx.impact && extras?.impactId) {
+      clips.push(fxClip(makeId, extras.impactId, 'Impact', bar * barLen, 2 * barLen, 0.5 + 0.5 * e))
     }
     bar += sec.bars
   }
@@ -262,6 +382,8 @@ export function riserSamples(sr, seconds) {
   }
   return out
 }
+
+// Impact on the "1" of a drop: sub boom plus a decaying noise wash.
 
 // Impact on the "1" of a drop: sub boom plus a decaying noise wash.
 export function impactSamples(sr, seconds) {

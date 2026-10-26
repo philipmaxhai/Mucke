@@ -4,7 +4,20 @@ import { engine } from '../audio/engine.js'
 import { LENGTHS, buildArrangement, planSongs, suggest } from '../mashup/arrange.js'
 import { analyzeBuffer, loopStems, stretchBuffer } from '../mashup/client.js'
 import { ALL_KEYS, camelotLabel, keyName } from '../mashup/keys.js'
-import { ROLES, TEMPLATES, TRACKS, buildNewSong, impactSamples, pickRegions, riserSamples, suggestNewSongs } from '../mashup/newsong.js'
+import {
+  REGION_LABELS,
+  ROLES,
+  STYLES,
+  TRACKS,
+  buildNewSong,
+  describeParams,
+  impactSamples,
+  pickRegions,
+  riserSamples,
+  sectionBars,
+  sourcesFor,
+  suggestNewSongs,
+} from '../mashup/newsong.js'
 import { formatTime, uid } from '../state/project.js'
 
 const MAX_SONGS = 4
@@ -46,7 +59,7 @@ export function newSongTracks(clips) {
     color: t.color,
     mute: false,
     solo: false,
-    fx: { ...DEFAULT_FX },
+    fx: { ...DEFAULT_FX, ...t.fx },
   }))
 }
 
@@ -65,9 +78,15 @@ function toBuffer(ctx, channels) {
   return b
 }
 
+function materialize(sug, { plan, lib, targetBpm, extras }, length) {
+  const letters = new Map(plan.map((s) => [s.id, s.letter]))
+  const arrangement = buildNewSong(sug.params, lib, { targetBpm, length, makeId: () => uid('c'), extras, letters })
+  return { ...sug, ...describeParams(sug.params, plan), arrangement, tracks: newSongTracks(arrangement.clips) }
+}
+
 export default function MashupStudio({ open, onClose, state, notify, onApply, stopTransport }) {
   const [songs, setSongs] = useState([])
-  const [settings, setSettings] = useState({ mode: 'song', baseId: null, bpm: '', matchKey: true, length: 'mittel' })
+  const [settings, setSettings] = useState({ mode: 'song', baseId: null, bpm: '', matchKey: true, length: 'mittel', clarity: 0.6 })
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(null)
   const [audition, setAudition] = useState(null)
@@ -86,7 +105,8 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
   const baseId = ready.some((s) => s.id === settings.baseId) ? settings.baseId : ready[0]?.id
   const base = ready.find((s) => s.id === baseId)
   const targetBpm = Number(settings.bpm) >= 60 && Number(settings.bpm) <= 200 ? Number(settings.bpm) : base ? base.analysis.bpm : 124
-  const signature = JSON.stringify([ready.map((s) => [s.id, s.key, s.excluded]), baseId, targetBpm, settings.matchKey, settings.length, settings.mode])
+  // in song mode the length only rebuilds the arrangement, it does not need new stems
+  const signature = JSON.stringify([ready.map((s) => [s.id, s.key, s.excluded]), baseId, targetBpm, settings.matchKey, settings.mode === 'song' ? settings.clarity : settings.length, settings.mode])
   const stale = result && result.signature !== signature
 
   const updateSong = useCallback((id, patch) => setSongs((list) => list.map((s) => (s.id === id ? { ...s, ...patch } : s))), [])
@@ -296,7 +316,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
         })
       for (const song of plan) {
         const regions = pickRegions(song)
-        const key = JSON.stringify([song.tempo.toFixed(5), song.semis, regions])
+        const key = JSON.stringify([song.tempo.toFixed(5), song.semis, regions, settings.clarity])
         const cached = library.current.get(song.id)
         if (cached?.key === key) {
           fresh.set(song.id, cached)
@@ -326,6 +346,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
               tempo: song.tempo,
               semis: song.semis,
               beatSec: barLen / 4,
+              clarity: settings.clarity,
             },
             (p) => {
               progress.set(`${song.id}:${id}`, p)
@@ -369,17 +390,35 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
       }
 
       const lib = new Map([...fresh].map(([id, e]) => [id, e.regions]))
-      const suggestions = suggestNewSongs(plan, lib, { seed }).map((sug) => {
-        const arrangement = buildNewSong(sug, lib, { targetBpm, length: settings.length, makeId: () => uid('c'), extras: fxBuffers.current })
-        return { ...sug, arrangement, tracks: newSongTracks(arrangement.clips) }
-      })
-      setResult({ mode: 'song', plan, targetBpm, suggestions, seed, signature })
+      const ctxInfo = { plan, lib, targetBpm, extras: fxBuffers.current }
+      const suggestions = suggestNewSongs(plan, lib, { seed }).map((sug) => materialize(sug, ctxInfo, settings.length))
+      setResult({ mode: 'song', plan, targetBpm, suggestions, seed, signature, ...ctxInfo })
     } catch (err) {
       notify(`Neuer Song fehlgeschlagen: ${err?.message || err}`, 'error')
     } finally {
       setBusy(null)
     }
   }
+
+  // --- live editing of a "Neuer Song" suggestion ---------------------------------------
+
+  const restartTimer = useRef(null)
+  const updateParams = (key, patch) => {
+    const r = result
+    const old = r.suggestions.find((s) => s.key === key)
+    const next = materialize({ ...old, params: { ...old.params, ...patch } }, r, settings.length)
+    setResult({ ...r, suggestions: r.suggestions.map((s) => (s.key === key ? next : s)) })
+    if (previewRef.current?.key === key) {
+      clearTimeout(restartTimer.current)
+      restartTimer.current = setTimeout(() => playPreview(next, engine.position()), 150)
+    }
+  }
+
+  // length changes in song mode just rebuild the arrangements
+  useEffect(() => {
+    setResult((r) => (r?.mode === 'song' ? { ...r, suggestions: r.suggestions.map((s) => materialize(s, r, settings.length)) } : r))
+    stopPreview()
+  }, [settings.length, stopPreview])
 
   const apply = (sug) => {
     stopPreview()
@@ -523,7 +562,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
                 Länge
                 <span className="flex">
                   {Object.keys(LENGTHS).map((l, i) => {
-                    const bars = settings.mode === 'song' ? TEMPLATES[l].reduce((a, s) => a + s.bars, 0) : LENGTHS[l].reduce((a, s) => a + s[1], 0)
+                    const bars = settings.mode === 'song' ? sectionBars('club', l) : LENGTHS[l].reduce((a, s) => a + s[1], 0)
                     return (
                       <button
                         key={l}
@@ -541,6 +580,23 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
                 <input type="checkbox" checked={settings.matchKey} onChange={(e) => setSettings((s) => ({ ...s, matchKey: e.target.checked }))} />
                 Tonarten angleichen
               </label>
+              {settings.mode === 'song' && (
+                <label
+                  className="flex flex-col gap-1 text-xs text-zinc-400"
+                  title="Wie streng die Songs in Drums, Bass, Melodie und Atmo getrennt werden. Höher = klarer und weniger verwaschen, aber einzelne Schichten können etwas härter klingen."
+                >
+                  Klarheit der Trennung · {Math.round(settings.clarity * 100)} %
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={settings.clarity}
+                    className="h-9 w-40"
+                    onChange={(e) => setSettings((s) => ({ ...s, clarity: Number(e.target.value) }))}
+                  />
+                </label>
+              )}
               <div className="ml-auto flex gap-2">
                 {result && (
                   <button className={btn} onClick={() => generate(result.seed + 1)} disabled={!!busy} title="Andere Abschnitte und Reihenfolgen ausprobieren">
@@ -582,6 +638,8 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
                     onPlay={(from) => playPreview(sug, from)}
                     onStop={stopPreview}
                     onApply={() => apply(sug)}
+                    onParams={(patch) => updateParams(sug.key, patch)}
+                    lib={result.lib}
                   />
                 ))}
               </div>
@@ -705,7 +763,8 @@ function SuggestionCard({ Card, ...props }) {
   return Card ? <Card {...props} /> : <MashupCard {...props} />
 }
 
-function NewSongCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
+function NewSongCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply, onParams, lib }) {
+  const [open, setOpen] = useState(false)
   const songOf = (id) => plan.find((s) => s.id === id)
   const { sections, duration, clips } = sug.arrangement
   const total = sections.reduce((a, s) => a + s.bars, 0)
@@ -764,7 +823,11 @@ function NewSongCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
           <li key={i}>• {n}</li>
         ))}
       </ul>
-      <div className="mt-auto flex gap-2">
+      {open && <SongControls params={sug.params} plan={plan} lib={lib} onParams={onParams} />}
+      <div className="mt-auto flex flex-wrap gap-2">
+        <button className={`${btn} ${open ? 'border-fuchsia-400 text-fuchsia-100' : ''}`} onClick={() => setOpen((o) => !o)} title="Stil, Quellen und Lautstärke jeder Schicht, Pumpen und Energie einstellen">
+          ⚙ Regler
+        </button>
         {previewing ? (
           <button className={`${btn} border-fuchsia-400 text-fuchsia-100`} onClick={onStop}>
             ■ Stopp
@@ -777,6 +840,100 @@ function NewSongCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
         <button className={`${btn} border-cyan-500/70 bg-cyan-500/10 text-cyan-100`} onClick={onApply} title="Ersetzt die Clips in der Timeline (Strg+Z macht es rückgängig)">
           ⤓ In Timeline übernehmen
         </button>
+      </div>
+    </div>
+  )
+}
+
+function SongControls({ params, plan, lib, onParams }) {
+  const letter = (id) => plan.find((s) => s.id === id)?.letter ?? '?'
+  const id = (o) => (o ? `${o.song}|${o.region}` : '')
+  const setSource = (role, value) => {
+    if (!value) return onParams({ sources: { ...params.sources, [role]: null } })
+    const [song, region] = value.split('|')
+    const opt = sourcesFor(lib, plan, role).find((o) => o.song === song && o.region === region)
+    onParams({ sources: { ...params.sources, [role]: opt } })
+  }
+  const range = 'h-4 w-full accent-fuchsia-400'
+  return (
+    <div className="space-y-3 rounded-md border border-zinc-800 bg-zinc-950/60 p-3 text-xs text-zinc-300">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-zinc-500">Stil</span>
+        {Object.entries(STYLES).map(([key, st]) => (
+          <button
+            key={key}
+            className={`rounded border px-2 py-1 ${params.style === key ? 'border-fuchsia-400 bg-fuchsia-500/15 text-fuchsia-100' : 'border-zinc-700 hover:border-zinc-500'}`}
+            onClick={() => onParams({ style: key, pump: STYLES[key].pump })}
+            title={st.blurb}
+          >
+            {st.name}
+          </button>
+        ))}
+      </div>
+      <div className="grid grid-cols-[6.5rem_minmax(0,1fr)_minmax(0,1fr)] items-center gap-x-2 gap-y-1.5">
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">Schicht</span>
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">kommt aus</span>
+        <span className="text-[10px] uppercase tracking-wider text-zinc-500">Lautstärke</span>
+        {ROLES.map((role) => {
+          const options = sourcesFor(lib, plan, role.key)
+          const level = params.levels[role.key] ?? 1
+          return [
+            <span key={`${role.key}-l`} className="truncate">
+              {role.label}
+            </span>,
+            <select
+              key={`${role.key}-s`}
+              className="h-7 min-w-0 rounded border border-zinc-700 bg-zinc-900 px-1"
+              value={id(params.sources[role.key])}
+              onChange={(e) => setSource(role.key, e.target.value)}
+            >
+              <option value="">– aus –</option>
+              {options.map((o) => (
+                <option key={id(o)} value={id(o)}>
+                  Song {letter(o.song)} · {REGION_LABELS[o.region]}
+                </option>
+              ))}
+            </select>,
+            <span key={`${role.key}-v`} className="flex items-center gap-1">
+              <input
+                type="range"
+                min={0}
+                max={1.5}
+                step={0.05}
+                value={level}
+                className={range}
+                onChange={(e) => onParams({ levels: { ...params.levels, [role.key]: Number(e.target.value) } })}
+              />
+              <span className="w-9 text-right font-mono text-[10px] text-zinc-500">{Math.round(level * 100)}%</span>
+            </span>,
+          ]
+        })}
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="block" title="Bass und Flächen ducken sich bei jeder Kick weg, wie mit Sidechain-Kompressor. Macht den Mix klarer.">
+          <span className="flex justify-between">
+            <span>Pumpen (Sidechain)</span>
+            <span className="font-mono text-zinc-500">{Math.round(params.pump * 100)}%</span>
+          </span>
+          <input type="range" min={0} max={0.8} step={0.05} value={params.pump} className={range} onChange={(e) => onParams({ pump: Number(e.target.value) })} />
+        </label>
+        <label className="block" title="Wenig = sparsamer, tiefer Groove. Viel = mehr Schichten, mehr Atmo, lautere Riser.">
+          <span className="flex justify-between">
+            <span>Energie</span>
+            <span className="font-mono text-zinc-500">{Math.round(params.energy * 100)}%</span>
+          </span>
+          <input type="range" min={0} max={1} step={0.05} value={params.energy} className={range} onChange={(e) => onParams({ energy: Number(e.target.value) })} />
+        </label>
+      </div>
+      <div className="flex flex-wrap gap-4">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={params.riser} onChange={(e) => onParams({ riser: e.target.checked })} />
+          Riser & Impacts
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={params.sweeps} onChange={(e) => onParams({ sweeps: e.target.checked })} />
+          Filter-Sweeps im Build-up
+        </label>
       </div>
     </div>
   )

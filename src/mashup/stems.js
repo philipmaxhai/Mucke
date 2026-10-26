@@ -6,11 +6,14 @@ import { fft } from './dsp.js'
 
 export const STEMS = ['drums', 'bass', 'music', 'air']
 
-const N = 4096
-const HOP = 1024
+// 46 ms windows at 44.1 kHz: short enough that drum hits stay tight, long enough for bass notes
+const N = 2048
+const HOP = 512
 
 // `beats`: beat times (seconds) inside the audio; a kick on a beat is moved from the bass layer to the drums.
-export function separateStems(channels, sr, beats = [], onProgress = () => {}) {
+// `clarity` 0..1: how hard each time-frequency point is assigned to one layer. Higher = less bleed between
+// layers (clearer when layers of different songs are stacked), lower = smoother but more "washed" layers.
+export function separateStems(channels, sr, beats = [], onProgress = () => {}, clarity = 0.6) {
   const chans = channels.length > 1 ? channels.slice(0, 2) : [channels[0], channels[0]]
   const len = chans[0].length
   const bins = N / 2 + 1
@@ -48,7 +51,7 @@ export function separateStems(channels, sr, beats = [], onProgress = () => {}) {
   }
 
   // Harmonic: median along time (~0.4 s); percussive: median along frequency.
-  const hT = Math.max(9, Math.round((0.4 * sr) / HOP)) | 1
+  const hT = Math.max(9, Math.round((0.3 * sr) / HOP)) | 1
   const pF = 17
   const harm = new Float32Array(frames * bins)
   const perc = new Float32Array(frames * bins)
@@ -56,7 +59,8 @@ export function separateStems(channels, sr, beats = [], onProgress = () => {}) {
   for (let k = 0; k < bins; k++) {
     for (let f = 0; f < frames; f++) {
       let n = 0
-      for (let d = -(hT >> 1); d <= hT >> 1; d++) {
+      // every second frame is enough for a time median over ~0.3 s and halves the cost
+      for (let d = -(hT >> 1); d <= hT >> 1; d += 2) {
         const g = f + d
         if (g >= 0 && g < frames) tmp[n++] = mag[g * bins + k]
       }
@@ -92,12 +96,25 @@ export function separateStems(channels, sr, beats = [], onProgress = () => {}) {
   const norm = new Float64Array(len + 2 * pad + N)
   for (let f = 0; f < frames; f++) for (let i = 0; i < N; i++) norm[f * HOP + i] += win[i] * win[i]
   const out = STEMS.map(() => [new Float32Array(len), new Float32Array(len)])
+  const power = 2 + 4 * clarity
+  const floor = 0.3 * clarity
+  // harmonic share per time-frequency point, computed once for all stems and channels
+  const harmMask = new Float32Array(frames * bins)
+  for (let f = 0; f < frames; f++) {
+    for (let k = 0; k < bins; k++) {
+      const i = f * bins + k
+      const h = harm[i]
+      const p = perc[i]
+      let mh = h + p > 0 ? 1 / (1 + (p / (h + 1e-12)) ** power) : 0.5
+      // push uncertain points towards one side; harmonic + percussive still add up to 1
+      mh = Math.min(1, Math.max(0, (mh - floor) / (1 - 2 * floor)))
+      // a kick drum's low boom looks tonal, so hand it to the drums right after each kick
+      if (low[k] > 0) mh *= 1 - kickGate[f] * low[k]
+      harmMask[i] = mh
+    }
+  }
   const maskOf = (stem, f, k) => {
-    const h = harm[f * bins + k] ** 2
-    const p = perc[f * bins + k] ** 2
-    let mh = h + p > 0 ? h / (h + p) : 0.5
-    // a kick drum's low boom looks tonal, so hand it to the drums right after each kick
-    if (low[k] > 0) mh *= 1 - kickGate[f] * low[k]
+    const mh = harmMask[f * bins + k]
     if (stem === 0) return 1 - mh
     if (stem === 1) return mh * low[k]
     if (stem === 3) return mh * high[k]
@@ -161,7 +178,7 @@ function kickEnvelope(mag, frames, bins, binHz, sr, beats) {
     energy[f] = e
   }
   const frameOf = (t) => Math.round((t * sr) / HOP) // frame f is centred on sample f * HOP
-  const tau = (0.12 * sr) / HOP
+  const tau = (0.16 * sr) / HOP
   for (const t of beats) {
     const f0 = frameOf(t)
     if (f0 < 0 || f0 >= frames) continue

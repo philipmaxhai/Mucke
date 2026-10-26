@@ -4,7 +4,8 @@ const EDGE_FADE = 0.004
 // Short fades at both ends avoid clicks at cut points and loop boundaries.
 // Optional clip transitions (used by the mashup studio): fadeIn/fadeOut in seconds,
 // inFx { type: 'bass', len } = bass cut for the first `len` seconds, then the bass drops in ("bass swap"),
-// outFx { type: 'hp', len } = high-pass sweep over the last `len` seconds.
+// outFx { type: 'hp', len } = high-pass sweep over the last `len` seconds,
+// duck { amount, beat } = sidechain-style pumping: the level dips on every beat (clip start = beat 1) and swells back.
 export function schedulePart(ctx, buffer, clip, from, to, when, destination) {
   const s = Math.max(clip.start, from)
   const e = Math.min(clip.start + clip.length, to)
@@ -55,6 +56,12 @@ export function schedulePart(ctx, buffer, clip, from, to, when, destination) {
     nodes.push(hp)
   }
 
+  if (clip.duck?.amount > 0 && clip.duck.beat > 0) {
+    const pump = ctx.createGain()
+    schedulePump(pump.gain, clip.duck.amount, clip.duck.beat, a, b, when)
+    nodes.push(pump)
+  }
+
   let prev = src
   for (const node of nodes) {
     prev.connect(node)
@@ -66,6 +73,34 @@ export function schedulePart(ctx, buffer, clip, from, to, when, destination) {
   src.start(when, offset, dur * clip.rate)
   src.onended = () => nodes.forEach((node) => node.disconnect())
   return src
+}
+
+const ATTACK = 0.004
+
+// Level of the pump `u` seconds after a beat.
+function pumpAt(u, amount, beat) {
+  const dip = 1 - amount
+  if (u < ATTACK) return 1 - (amount * u) / ATTACK
+  const rec = beat * 0.2
+  return dip + (1 - dip) * (1 - Math.exp(-(u - ATTACK) / rec))
+}
+
+function schedulePump(param, amount, beat, a, b, when) {
+  const span = beat * 0.9 // leave a gap before the next beat so curves never overlap
+  const steps = 48
+  const curveFrom = (u0) => {
+    const c = new Float32Array(steps)
+    for (let i = 0; i < steps; i++) c[i] = pumpAt(u0 + ((span - u0) * i) / (steps - 1), amount, beat)
+    return c
+  }
+  const since = ((a % beat) + beat) % beat
+  if (since < span - 0.01) param.setValueCurveAtTime(curveFrom(since), when, Math.min(span - since, b - a))
+  else param.setValueAtTime(pumpAt(since, amount, beat), when)
+  for (let t = Math.ceil(a / beat - 1e-9) * beat; t < b - 0.01; t += beat) {
+    if (t <= a + 1e-6) continue
+    // the curve must end before the window ends, otherwise it would outlive this scheduled part
+    param.setValueCurveAtTime(curveFrom(0), when + t - a, Math.min(span, b - t))
+  }
 }
 
 // Schedules a piecewise curve (points in clip-local seconds) for the window [a, b] starting at context time `when`.

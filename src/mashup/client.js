@@ -76,7 +76,7 @@ export async function stretchBuffer(ctx, buffer, tempo, semis, onProgress) {
 
 // Cuts a loop region (song time, with padding) out of `buffer`, fits it to the target tempo/key and
 // splits it into drums / bass / music / air. Returns { stemName: AudioBuffer }.
-export async function loopStems(ctx, buffer, { start, end, padBefore, loopSeconds, tempo, semis, beatSec }, onProgress) {
+export async function loopStems(ctx, buffer, { start, end, padBefore, loopSeconds, tempo, semis, beatSec, clarity }, onProgress) {
   const sr = buffer.sampleRate
   const i0 = Math.max(0, Math.floor(start * sr))
   const i1 = Math.min(buffer.length, Math.ceil(end * sr))
@@ -93,6 +93,7 @@ export async function loopStems(ctx, buffer, { start, end, padBefore, loopSecond
       tempo,
       semis,
       beats,
+      clarity,
       trimStart: Math.round(padOut * sr),
       trimLength: Math.round(loopSeconds * sr),
     },
