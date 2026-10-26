@@ -131,10 +131,12 @@ export function splitClip(clip, at) {
   if (at <= clip.start + 0.005 || at >= clip.start + clip.length - 0.005) return null
   const leftLen = at - clip.start
   return [
-    { ...clip, length: leftLen },
+    { ...clip, length: leftLen, fadeOut: 0, outFx: null },
     {
       ...clip,
       id: uid('c'),
+      fadeIn: 0,
+      inFx: null,
       start: at,
       offset: clip.offset + leftLen * clip.rate,
       length: clip.length - leftLen,

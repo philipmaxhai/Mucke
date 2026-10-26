@@ -6,6 +6,7 @@ import { downloadBlob } from './audio/wav.js'
 import ClipInspector from './components/ClipInspector.jsx'
 import FxPanel from './components/FxPanel.jsx'
 import Knob from './components/Knob.jsx'
+import MashupStudio from './components/MashupStudio.jsx'
 import { LevelMeter, PositionDisplay, RecTimer, SilenceHint } from './components/Meters.jsx'
 import Timeline from './components/Timeline.jsx'
 import TrackHeaders from './components/TrackHeaders.jsx'
@@ -40,6 +41,11 @@ export default function App() {
   const [rec, setRec] = useState(null)
   const [toast, setToast] = useState(null)
   const [exporting, setExporting] = useState(false)
+  const [mashupOpen, setMashupOpen] = useState(false)
+  const mashupOpenRef = useRef(false)
+  mashupOpenRef.current = mashupOpen
+  const playingRef = useRef(false)
+  playingRef.current = playing
   const stateRef = useRef(state)
   stateRef.current = state
   const playFrom = useRef(0)
@@ -218,6 +224,48 @@ export default function App() {
     dispatch({ type: 'set', patch: { loop: { enabled: true, start: clip.start, end: clip.start + clip.length } } })
   }, [])
 
+  // --- mashup ----------------------------------------------------------------
+
+  const stopTransport = useCallback(() => {
+    if (!playingRef.current) return
+    const pos = engine.stop()
+    setPlaying(false)
+    dispatch({ type: 'set', patch: { playhead: pos } })
+  }, [])
+
+  const applyMashup = useCallback(
+    ({ tracks, clips, bpm }) => {
+      stopTransport()
+      ensureAudio()
+      const s = stateRef.current
+      // empty tracks (like the default ones) make room for the song tracks; tracks with clips stay for undo
+      const merged = s.tracks.filter((t) => s.clips.some((c) => c.trackId === t.id) || tracks.some((x) => x.id === t.id)).map((t) => {
+        const fresh = tracks.find((x) => x.id === t.id)
+        return fresh ? { ...t, fx: { ...t.fx, hp: fresh.fx.hp } } : t
+      })
+      for (const t of tracks) if (!s.tracks.some((x) => x.id === t.id)) merged.push(t)
+      const duration = clips.reduce((m, c) => Math.max(m, c.start + c.length), 0)
+      const bar = beatSec(bpm) * 4
+      dispatch({
+        type: 'set',
+        patch: {
+          tracks: merged,
+          bpm,
+          playhead: 0,
+          loop: { enabled: false, start: 0, end: bar * 4 },
+          zoom: Math.min(1200, Math.max(4, (window.innerWidth - 260) / Math.max(1, duration))),
+          selectedTrackId: tracks[0]?.id ?? s.selectedTrackId,
+          selectedClipId: null,
+        },
+      })
+      dispatch({ type: 'setClips', record: true, clips })
+      notify('Mashup ist in der Timeline. Jeder Teil ist ein normaler Clip: verschieben, trimmen, Effekte pro Song-Spur. Strg+Z macht es rückgängig.')
+    },
+    [ensureAudio, notify, stopTransport],
+  )
+
+  const closeMashup = useCallback(() => setMashupOpen(false), [])
+
   // --- recording -----------------------------------------------------------
 
   const finishRecording = useCallback(() => {
@@ -268,6 +316,7 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e) => {
+      if (mashupOpenRef.current) return
       const tag = e.target.tagName
       if ((tag === 'INPUT' && e.target.type !== 'range') || tag === 'SELECT' || tag === 'TEXTAREA') return
       const mod = e.ctrlKey || e.metaKey
@@ -429,6 +478,13 @@ export default function App() {
               </button>
             </>
           )}
+          <button
+            className={`${btn} border-fuchsia-500/60 bg-fuchsia-500/10 text-fuchsia-100 hover:border-fuchsia-400`}
+            onClick={() => setMashupOpen(true)}
+            title="Mehrere Songs zu einem Track kombinieren, mit automatischer Anpassung und Vorschlägen"
+          >
+            ✨ Mashup
+          </button>
           <button className={btn} onClick={() => fileInput.current.click()} title="Audiodatei importieren (oder in die Timeline ziehen)">
             ⇪ Import
           </button>
@@ -519,6 +575,15 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      <MashupStudio
+        open={mashupOpen}
+        onClose={closeMashup}
+        state={state}
+        notify={notify}
+        onApply={applyMashup}
+        stopTransport={stopTransport}
+      />
 
       {toast && (
         <div
