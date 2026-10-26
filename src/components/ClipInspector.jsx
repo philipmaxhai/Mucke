@@ -41,6 +41,26 @@ export default function ClipInspector({ clip, state, onUpdate, onSplit, onDuplic
           value={clip.gain}
           onChange={(e) => onUpdate({ gain: Number(e.target.value) }, false)}
         />
+        <span>Fade In</span>
+        <input
+          type="range"
+          min={0}
+          max={Math.min(16, beats / 2)}
+          step={0.25}
+          value={(clip.fadeIn || 0) / beatSec(state.bpm)}
+          onChange={(e) => onUpdate({ fadeIn: Number(e.target.value) * beatSec(state.bpm) }, false)}
+          title="Einblenden in Beats"
+        />
+        <span>Fade Out</span>
+        <input
+          type="range"
+          min={0}
+          max={Math.min(16, beats / 2)}
+          step={0.25}
+          value={(clip.fadeOut || 0) / beatSec(state.bpm)}
+          onChange={(e) => onUpdate({ fadeOut: Number(e.target.value) * beatSec(state.bpm) }, false)}
+          title="Ausblenden in Beats"
+        />
         <span>Tempo</span>
         <span className="text-zinc-200">{(clip.rate * 100).toFixed(1)}%</span>
       </div>

@@ -1,0 +1,639 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { DEFAULT_FX } from '../audio/fx.js'
+import { engine } from '../audio/engine.js'
+import { LENGTHS, buildArrangement, planSongs, suggest } from '../mashup/arrange.js'
+import { analyzeBuffer, stretchBuffer } from '../mashup/client.js'
+import { ALL_KEYS, camelotLabel, keyName } from '../mashup/keys.js'
+import { formatTime, uid } from '../state/project.js'
+
+const MAX_SONGS = 4
+const LETTERS = ['A', 'B', 'C', 'D']
+const SONG_COLORS = { A: '#f472b6', B: '#22d3ee', C: '#a3e635', D: '#fb923c' }
+const LABEL_COLORS = {
+  Intro: '#475569',
+  Groove: '#0284c7',
+  'Build-up': '#d97706',
+  Drop: '#dc2626',
+  Break: '#7c3aed',
+  Outro: '#334155',
+}
+
+const btn =
+  'inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-200 hover:border-zinc-500 disabled:opacity-40'
+const primary =
+  'inline-flex h-10 items-center justify-center gap-2 rounded-md bg-gradient-to-r from-fuchsia-500 to-cyan-500 px-4 text-sm font-semibold text-white shadow-lg hover:brightness-110 disabled:opacity-40'
+
+const pct = (v) => `${v > 0 ? '+' : v < 0 ? '−' : '±'}${Math.abs(v * 100).toFixed(1).replace('.', ',')} %`
+const semisText = (s) => (s === 0 ? 'Tonhöhe bleibt' : `${s > 0 ? '+' : '−'}${Math.abs(s)} Halbton${Math.abs(s) === 1 ? '' : 'e'}`)
+
+export function mashupTracks(plan, layerSongs = new Set()) {
+  return plan.map((song) => ({
+    id: `mx-${song.id}`,
+    name: `${song.letter} · ${song.name}`.slice(0, 40),
+    color: song.color,
+    mute: false,
+    solo: false,
+    // layered songs lose their bass so they don't fight with the base song
+    fx: { ...DEFAULT_FX, hp: layerSongs.has(song.id) ? 180 : 20 },
+  }))
+}
+
+export default function MashupStudio({ open, onClose, state, notify, onApply, stopTransport }) {
+  const [songs, setSongs] = useState([])
+  const [settings, setSettings] = useState({ baseId: null, bpm: '', matchKey: true, length: 'mittel' })
+  const [result, setResult] = useState(null)
+  const [busy, setBusy] = useState(null)
+  const [audition, setAudition] = useState(null)
+  const [preview, setPreview] = useState(null)
+  const [dragOver, setDragOver] = useState(false)
+  const stretched = useRef(new Map())
+  const auditionRef = useRef(null)
+  const previewRef = useRef(null)
+  const fileInput = useRef(null)
+  const stateRef = useRef(state)
+  stateRef.current = state
+
+  const ready = songs.filter((s) => s.status === 'ready')
+  const baseId = ready.some((s) => s.id === settings.baseId) ? settings.baseId : ready[0]?.id
+  const base = ready.find((s) => s.id === baseId)
+  const targetBpm = Number(settings.bpm) >= 60 && Number(settings.bpm) <= 200 ? Number(settings.bpm) : base ? base.analysis.bpm : 124
+  const signature = JSON.stringify([ready.map((s) => [s.id, s.key, s.excluded]), baseId, targetBpm, settings.matchKey, settings.length])
+  const stale = result && result.signature !== signature
+
+  const updateSong = useCallback((id, patch) => setSongs((list) => list.map((s) => (s.id === id ? { ...s, ...patch } : s))), [])
+
+  // --- playback helpers ----------------------------------------------------------
+
+  const stopAudition = useCallback(() => {
+    const a = auditionRef.current
+    auditionRef.current = null
+    setAudition(null)
+    try {
+      a?.src.stop()
+    } catch {
+      // already ended
+    }
+  }, [])
+
+  const stopPreview = useCallback(() => {
+    const p = previewRef.current
+    if (!p) return
+    previewRef.current = null
+    setPreview(null)
+    if (engine.playing) engine.stop()
+    engine.onStop = p.savedOnStop
+    engine.syncTracks(stateRef.current.tracks, stateRef.current.bpm)
+  }, [])
+
+  useEffect(() => {
+    if (!open) {
+      stopPreview()
+      stopAudition()
+      return
+    }
+    const onKey = (e) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose, stopPreview, stopAudition])
+
+  const playAudition = (song, index) => {
+    const key = `${song.id}:${index}`
+    const wasThis = auditionRef.current?.key === key
+    stopAudition()
+    stopPreview()
+    if (wasThis) return
+    stopTransport()
+    const ctx = engine.ensure()
+    const sec = song.analysis.sections[index]
+    const src = ctx.createBufferSource()
+    src.buffer = engine.buffers.get(song.bufferId)
+    const g = ctx.createGain()
+    g.gain.value = 0.9
+    src.connect(g)
+    g.connect(ctx.destination)
+    src.start(0, Math.max(0, sec.start), sec.end - Math.max(0, sec.start))
+    src.onended = () => {
+      g.disconnect()
+      if (auditionRef.current?.src === src) {
+        auditionRef.current = null
+        setAudition(null)
+      }
+    }
+    auditionRef.current = { src, key }
+    setAudition(key)
+  }
+
+  const playPreview = (sug, from = 0) => {
+    stopAudition()
+    stopTransport()
+    const savedOnStop = previewRef.current ? previewRef.current.savedOnStop : engine.onStop
+    engine.ensure()
+    const tracks = mashupTracks(result.plan, sug.arrangement.layerSongs)
+    engine.syncTracks([...stateRef.current.tracks.map((t) => ({ ...t, mute: true, solo: false })), ...tracks], result.targetBpm)
+    previewRef.current = { key: sug.key, savedOnStop }
+    engine.onStop = () => stopPreview()
+    engine.play({ clips: sug.arrangement.clips, bpm: result.targetBpm, loop: { enabled: false, start: 0, end: 0 }, metronome: false }, from)
+    setPreview({ key: sug.key, duration: sug.arrangement.duration })
+  }
+
+  // --- songs -----------------------------------------------------------------------
+
+  const songsRef = useRef(songs)
+  songsRef.current = songs
+
+  const addSong = (buffer, name, bufferId) => {
+    const list = songsRef.current
+    if (list.length >= MAX_SONGS) return notify(`Maximal ${MAX_SONGS} Songs pro Mashup.`)
+    const letter = LETTERS.find((l) => !list.some((s) => s.letter === l))
+    const song = { id: uid('s'), letter, color: SONG_COLORS[letter], name, bufferId, status: 'analyzing', progress: 0, excluded: [] }
+    songsRef.current = [...list, song]
+    setSongs((l) => [...l, song])
+    analyzeBuffer(buffer, (p) => updateSong(song.id, { progress: p }))
+      .then((analysis) => updateSong(song.id, { status: 'ready', analysis, key: analysis.key }))
+      .catch((err) => updateSong(song.id, { status: 'error', error: err?.message || String(err) }))
+  }
+
+  const addFiles = async (files) => {
+    engine.ensure()
+    for (const file of files) {
+      if (songsRef.current.length >= MAX_SONGS) break
+      try {
+        const buffer = await engine.decode(await file.arrayBuffer())
+        const bufferId = uid('b')
+        engine.addBuffer(bufferId, buffer)
+        addSong(buffer, file.name.replace(/\.[^.]+$/, ''), bufferId)
+      } catch {
+        notify(`„${file.name}“ konnte nicht gelesen werden.`, 'error')
+      }
+    }
+  }
+
+  const timelineSources = []
+  for (const clip of state.clips) {
+    if (clip.songId || timelineSources.some((c) => c.bufferId === clip.bufferId)) continue
+    if (songs.some((s) => s.bufferId === clip.bufferId)) continue
+    timelineSources.push(clip)
+  }
+
+  const removeSong = (id) => {
+    stopAudition()
+    stopPreview()
+    setSongs((list) => list.filter((s) => s.id !== id))
+    setResult(null)
+  }
+
+  const toggleSection = (song, index) => {
+    const excluded = song.excluded.includes(index) ? song.excluded.filter((i) => i !== index) : [...song.excluded, index]
+    updateSong(song.id, { excluded })
+  }
+
+  // --- suggestions -------------------------------------------------------------------
+
+  const generate = async (seed) => {
+    if (!ready.length || busy) return
+    stopAudition()
+    stopPreview()
+    const plan = planSongs(
+      ready.map((s) => ({ ...s, analysis: { ...s.analysis, key: s.key } })),
+      { targetBpm, baseId, matchKey: settings.matchKey },
+    )
+    try {
+      const ctx = engine.ensure()
+      const progress = new Map()
+      const report = () => setBusy({ text: 'Passe Tempo und Tonart an …', p: [...progress.values()].reduce((a, b) => a + b, 0) / plan.length })
+      report()
+      await Promise.all(
+        plan.map(async (song) => {
+          const key = `${song.tempo.toFixed(5)}|${song.semis}`
+          const cached = stretched.current.get(song.id)
+          if (cached?.key === key) return progress.set(song.id, 1)
+          let bufferId = song.bufferId
+          if (Math.abs(song.tempo - 1) > 1e-4 || song.semis) {
+            const out = await stretchBuffer(ctx, engine.buffers.get(song.bufferId), song.tempo, song.semis, (p) => {
+              progress.set(song.id, p)
+              report()
+            })
+            bufferId = uid('b')
+            engine.addBuffer(bufferId, out)
+          }
+          // free the previous version unless the timeline still uses it
+          if (cached && cached.bufferId !== song.bufferId && !stateRef.current.clips.some((c) => c.bufferId === cached.bufferId)) {
+            engine.buffers.delete(cached.bufferId)
+            engine.peaks.delete(cached.bufferId)
+          }
+          stretched.current.set(song.id, { key, bufferId })
+          progress.set(song.id, 1)
+          report()
+        }),
+      )
+      const suggestions = suggest(plan, { length: settings.length, seed, baseId }).map((sug) => ({
+        ...sug,
+        arrangement: buildArrangement(sug, {
+          targetBpm,
+          bufferIdFor: (s) => stretched.current.get(s.id).bufferId,
+          trackIdFor: (s) => `mx-${s.id}`,
+          makeId: () => uid('c'),
+        }),
+      }))
+      setResult({ plan, targetBpm, suggestions, seed, signature })
+    } catch (err) {
+      notify(`Anpassen fehlgeschlagen: ${err?.message || err}`, 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const apply = (sug) => {
+    stopPreview()
+    const used = result.plan.filter((s) => sug.songs.includes(s.id))
+    onApply({ tracks: mashupTracks(used, sug.arrangement.layerSongs), clips: sug.arrangement.clips, bpm: result.targetBpm })
+    onClose()
+  }
+
+  if (!open) return null
+
+  const planFor = (id) => (result && !stale ? result.plan.find((p) => p.id === id) : null)
+
+  return (
+    <div className="fixed inset-0 z-40 flex bg-black/70 backdrop-blur-sm" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div
+        className={`relative m-auto flex h-full w-full max-w-6xl flex-col overflow-hidden border-zinc-800 bg-zinc-950 shadow-2xl sm:h-[94vh] sm:rounded-xl sm:border ${dragOver ? 'ring-2 ring-fuchsia-400' : ''}`}
+        onDragOver={(e) => {
+          if (![...e.dataTransfer.types].includes('Files')) return
+          e.preventDefault()
+          setDragOver(true)
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault()
+          setDragOver(false)
+          addFiles([...e.dataTransfer.files].filter((f) => f.type.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|aac|flac)$/i.test(f.name)))
+        }}
+      >
+        <div className="flex items-start gap-3 border-b border-zinc-800 px-5 py-4">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-bold text-zinc-100">✨ Mashup-Studio</h2>
+            <p className="text-xs leading-relaxed text-zinc-400">
+              Lade 2–4 Songs. Die App erkennt Tempo, Tonart und Abschnitte, passt alles aneinander an und schlägt dir fertige Mashups vor.
+              Alles läuft lokal in deinem Browser, ohne Cloud und ohne Kosten.
+            </p>
+          </div>
+          <button className={`${btn} w-9 px-0`} onClick={onClose} title="Schließen (Esc)">
+            ✕
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5">
+          {/* 1. songs */}
+          <section>
+            <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-zinc-500">1 · Songs</h3>
+            <div className="grid gap-3 md:grid-cols-2">
+              {songs.map((song) => (
+                <SongCard
+                  key={song.id}
+                  song={song}
+                  isBase={song.id === baseId}
+                  plan={planFor(song.id)}
+                  targetBpm={targetBpm}
+                  audition={audition}
+                  onAudition={(i) => playAudition(song, i)}
+                  onToggle={(i) => toggleSection(song, i)}
+                  onKey={(key) => updateSong(song.id, { key })}
+                  onBase={() => setSettings((s) => ({ ...s, baseId: song.id }))}
+                  onRemove={() => removeSong(song.id)}
+                />
+              ))}
+              {songs.length < MAX_SONGS && (
+                <div className="flex min-h-[9rem] flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-700 p-4 text-center">
+                  <button className={btn} onClick={() => fileInput.current.click()}>
+                    ⇪ Song-Datei hinzufügen
+                  </button>
+                  {timelineSources.length > 0 && (
+                    <select
+                      className="h-9 max-w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 text-sm text-zinc-300"
+                      value=""
+                      onChange={(e) => {
+                        const clip = timelineSources.find((c) => c.bufferId === e.target.value)
+                        if (clip) addSong(engine.buffers.get(clip.bufferId), clip.name, clip.bufferId)
+                      }}
+                    >
+                      <option value="">… oder Aufnahme aus der Timeline</option>
+                      {timelineSources.map((c) => (
+                        <option key={c.bufferId} value={c.bufferId}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <p className="text-[11px] text-zinc-500">oder Dateien hier hineinziehen · MP3, WAV, M4A, OGG</p>
+                  <input
+                    ref={fileInput}
+                    type="file"
+                    accept="audio/*"
+                    multiple
+                    hidden
+                    onChange={(e) => {
+                      addFiles([...e.target.files])
+                      e.target.value = ''
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+            {songs.length > 0 && (
+              <p className="mt-2 text-[11px] text-zinc-500">
+                Abschnitt anklicken = anhören · Rechtsklick = weglassen / wieder erlauben. Die Erkennung ist eine Schätzung, bei Bedarf Tonart von Hand korrigieren.
+              </p>
+            )}
+          </section>
+
+          {/* 2. settings */}
+          <section>
+            <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-zinc-500">2 · Anpassen</h3>
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1 text-xs text-zinc-400">
+                Ziel-Tempo
+                <span className="flex h-9 items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 pl-2">
+                  <input
+                    type="number"
+                    min={60}
+                    max={200}
+                    step={0.5}
+                    placeholder={base ? String(base.analysis.bpm) : '124'}
+                    className="w-16 bg-transparent font-mono text-cyan-300 outline-none placeholder:text-zinc-500"
+                    value={settings.bpm}
+                    onChange={(e) => setSettings((s) => ({ ...s, bpm: e.target.value }))}
+                  />
+                  <span className="pr-2 text-[10px] uppercase text-zinc-500">BPM</span>
+                </span>
+              </label>
+              <label className="flex flex-col gap-1 text-xs text-zinc-400">
+                Länge
+                <span className="flex">
+                  {Object.keys(LENGTHS).map((l, i) => {
+                    const bars = LENGTHS[l].reduce((a, s) => a + s[1], 0)
+                    return (
+                      <button
+                        key={l}
+                        className={`${btn} ${i ? '-ml-px rounded-l-none' : ''} ${i < 2 ? 'rounded-r-none' : ''} ${settings.length === l ? 'border-fuchsia-400 bg-fuchsia-500/15 text-fuchsia-100' : ''}`}
+                        onClick={() => setSettings((s) => ({ ...s, length: l }))}
+                        title={`${bars} Takte`}
+                      >
+                        {l[0].toUpperCase() + l.slice(1)} <span className="text-[10px] text-zinc-500">{formatTime((bars * 240) / targetBpm).slice(0, -3)}</span>
+                      </button>
+                    )
+                  })}
+                </span>
+              </label>
+              <label className="flex h-9 cursor-pointer items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-200">
+                <input type="checkbox" checked={settings.matchKey} onChange={(e) => setSettings((s) => ({ ...s, matchKey: e.target.checked }))} />
+                Tonarten angleichen
+              </label>
+              <div className="ml-auto flex gap-2">
+                {result && (
+                  <button className={btn} onClick={() => generate(result.seed + 1)} disabled={!!busy} title="Andere Abschnitte und Reihenfolgen ausprobieren">
+                    🎲 Neu würfeln
+                  </button>
+                )}
+                <button className={primary} onClick={() => generate(result && !stale ? result.seed : 1)} disabled={!ready.length || !!busy}>
+                  ✨ {result ? 'Vorschläge neu erzeugen' : 'Mashup-Vorschläge erzeugen'}
+                </button>
+              </div>
+            </div>
+            {ready.length === 1 && <p className="mt-2 text-xs text-amber-300/80">Mit nur einem Song entsteht ein Re-Edit. Für ein Mashup noch einen Song hinzufügen.</p>}
+          </section>
+
+          {/* 3. suggestions */}
+          <section>
+            <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-zinc-500">3 · Vorschläge</h3>
+            {busy && (
+              <div className="mb-3 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3 text-sm text-zinc-300">
+                {busy.text}
+                <div className="mt-2 h-1.5 overflow-hidden rounded bg-zinc-800">
+                  <div className="h-full bg-gradient-to-r from-fuchsia-500 to-cyan-400 transition-all" style={{ width: `${Math.round(busy.p * 100)}%` }} />
+                </div>
+              </div>
+            )}
+            {!result && !busy && <p className="text-sm text-zinc-500">Noch keine Vorschläge. Songs hinzufügen und auf „Mashup-Vorschläge erzeugen“ klicken.</p>}
+            {result && stale && !busy && <p className="mb-3 text-xs text-amber-300/80">Einstellungen geändert. Erzeuge die Vorschläge neu, damit sie passen.</p>}
+            {result && !result.suggestions.length && <p className="text-sm text-zinc-500">Keine passenden Abschnitte gefunden. Erlaube mehr Abschnitte oder nimm längere Songs.</p>}
+            {result && (
+              <div className={`grid gap-3 lg:grid-cols-2 ${stale ? 'opacity-50' : ''}`}>
+                {result.suggestions.map((sug) => (
+                  <SuggestionCard
+                    key={sug.key}
+                    sug={sug}
+                    plan={result.plan}
+                    bpm={result.targetBpm}
+                    previewing={preview?.key === sug.key}
+                    onPlay={(from) => playPreview(sug, from)}
+                    onStop={stopPreview}
+                    onApply={() => apply(sug)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SongCard({ song, isBase, plan, targetBpm, audition, onAudition, onToggle, onKey, onBase, onRemove }) {
+  const a = song.analysis
+  return (
+    <div className="flex min-w-0 flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+      <div className="flex items-center gap-2">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded font-black text-zinc-950" style={{ background: song.color }}>
+          {song.letter}
+        </span>
+        <span className="min-w-0 flex-1 truncate font-semibold text-zinc-100" title={song.name}>
+          {song.name}
+        </span>
+        {song.status === 'ready' &&
+          (isBase ? (
+            <span className="rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-bold uppercase text-zinc-900" title="Tempo und Tonart richten sich nach diesem Song">
+              Basis
+            </span>
+          ) : (
+            <button className="rounded border border-zinc-700 px-1.5 py-0.5 text-[10px] uppercase text-zinc-400 hover:text-zinc-100" onClick={onBase}>
+              als Basis
+            </button>
+          ))}
+        <button className="px-1 text-zinc-500 hover:text-rose-300" onClick={onRemove} title="Entfernen">
+          ✕
+        </button>
+      </div>
+
+      {song.status === 'analyzing' && (
+        <div className="text-xs text-zinc-400">
+          Analysiere Tempo, Tonart und Abschnitte … {Math.round(song.progress * 100)} %
+          <div className="mt-1 h-1 overflow-hidden rounded bg-zinc-800">
+            <div className="h-full bg-cyan-400 transition-all" style={{ width: `${Math.round(song.progress * 100)}%` }} />
+          </div>
+        </div>
+      )}
+      {song.status === 'error' && <div className="text-xs text-rose-300">{song.error}</div>}
+
+      {song.status === 'ready' && (
+        <>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="rounded bg-zinc-800 px-2 py-1 font-mono text-cyan-300" title={`Sicherheit ${a.bpmConfidence.toFixed(1)}`}>
+              {a.bpm} BPM
+            </span>
+            <select
+              className="rounded bg-zinc-800 px-1 py-1 font-mono text-fuchsia-200"
+              value={`${song.key.tonic}-${song.key.mode}`}
+              onChange={(e) => {
+                const [tonic, mode] = e.target.value.split('-')
+                onKey({ tonic: Number(tonic), mode })
+              }}
+              title="Erkannte Tonart (Camelot-Code für harmonisches Mixen). Bei Bedarf korrigieren."
+            >
+              {ALL_KEYS.map((k) => (
+                <option key={`${k.tonic}-${k.mode}`} value={`${k.tonic}-${k.mode}`} className="bg-zinc-900">
+                  {keyName(k)} · {camelotLabel(k)}
+                </option>
+              ))}
+            </select>
+            <span className="text-zinc-500">{formatTime(a.duration).slice(0, -3)}</span>
+          </div>
+          {plan && !isBase && (
+            <div className="text-[11px] text-zinc-400">
+              → {targetBpm} BPM ({pct(plan.tempo - 1)}) · {semisText(plan.semis)}
+              {plan.semis !== 0 && ` → ${keyName(plan.key)} (${camelotLabel(plan.key)})`}
+              {plan.keyDist <= 1 ? <span className="text-lime-300"> · passt harmonisch</span> : <span className="text-amber-300"> · tonal riskant</span>}
+              {Math.abs(plan.tempo - 1) > 0.1 && <span className="text-amber-300"> · starkes Stretching</span>}
+            </div>
+          )}
+          <EnergyLine values={a.barEnergy} />
+          <div className="flex h-9 w-full gap-px overflow-hidden rounded">
+            {a.sections.map((sec, i) => {
+              const off = song.excluded.includes(i)
+              const playing = audition === `${song.id}:${i}`
+              return (
+                <button
+                  key={i}
+                  className={`relative min-w-0 overflow-hidden px-1 text-left text-[10px] font-semibold leading-tight text-white/90 transition hover:brightness-125 ${
+                    off ? 'opacity-25 line-through' : ''
+                  } ${playing ? 'ring-2 ring-inset ring-white' : ''}`}
+                  style={{ flexGrow: sec.bars, flexBasis: 0, background: LABEL_COLORS[sec.label] }}
+                  onClick={() => onAudition(i)}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    onToggle(i)
+                  }}
+                  title={`${sec.label} · ${sec.bars} Takte · Energie ${Math.round(sec.energy * 100)} %\nKlick: anhören · Rechtsklick: ${off ? 'wieder erlauben' : 'weglassen'}`}
+                >
+                  <span className="block truncate">{playing ? '■ ' : ''}{sec.label}</span>
+                  <span className="block truncate font-normal text-white/60">{sec.bars} T</span>
+                </button>
+              )
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function EnergyLine({ values }) {
+  if (!values?.length) return null
+  const pts = values.map((v, i) => `${(i / Math.max(1, values.length - 1)) * 100},${20 - v * 18}`).join(' ')
+  return (
+    <svg viewBox="0 0 100 20" preserveAspectRatio="none" className="h-5 w-full" aria-hidden>
+      <polyline points={`0,20 ${pts} 100,20`} fill="rgba(34,211,238,0.12)" stroke="rgba(34,211,238,0.6)" strokeWidth="0.6" vectorEffect="non-scaling-stroke" />
+    </svg>
+  )
+}
+
+function SuggestionCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
+  const songOf = (id) => plan.find((s) => s.id === id)
+  const total = sug.slots.reduce((a, s) => a + s.bars, 0)
+  const duration = sug.arrangement.duration
+  const layered = new Set(sug.layers.map((l) => l.slot))
+  return (
+    <div className={`flex min-w-0 flex-col gap-3 rounded-lg border bg-zinc-900/60 p-3 ${previewing ? 'border-fuchsia-400' : 'border-zinc-800'}`}>
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-semibold text-zinc-100">{sug.title}</span>
+        <span className="text-xs text-zinc-500">{formatTime(duration).slice(0, -3)}</span>
+        <span className="rounded bg-lime-400/15 px-2 py-0.5 text-xs font-semibold text-lime-300" title="Wie gut Tempo, Tonart und Energie-Verlauf zusammenpassen">
+          {sug.score} % Match
+        </span>
+      </div>
+      <div
+        className="relative cursor-pointer"
+        onClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect()
+          onPlay(((e.clientX - r.left) / r.width) * duration)
+        }}
+        title="Klick: ab hier anhören"
+      >
+        <div className="flex h-10 gap-px overflow-hidden rounded">
+          {sug.slots.map((slot, i) => {
+            const song = songOf(slot.cand.song.id)
+            return (
+              <div
+                key={i}
+                className="relative min-w-0 overflow-hidden px-1 text-[10px] font-semibold leading-tight text-zinc-950"
+                style={{ flexGrow: slot.bars, flexBasis: 0, background: song.color }}
+              >
+                <span className="block truncate">{song.letter}</span>
+                <span className="block truncate font-normal">{slot.label}</span>
+                {layered.has(i) && (
+                  <span
+                    className="absolute inset-x-0 bottom-0 h-1.5"
+                    style={{ background: songOf(sug.layers.find((l) => l.slot === i).cand.song.id).color, boxShadow: '0 -1px 0 rgba(0,0,0,0.5)' }}
+                  />
+                )}
+              </div>
+            )
+          })}
+        </div>
+        {previewing && <PreviewHead duration={duration} />}
+        <div className="mt-1 flex justify-between text-[10px] text-zinc-500">
+          <span>{total} Takte</span>
+          <span>{bpm} BPM</span>
+        </div>
+      </div>
+      <ul className="space-y-1 text-xs leading-relaxed text-zinc-400">
+        {sug.notes.map((n, i) => (
+          <li key={i}>• {n}</li>
+        ))}
+      </ul>
+      <div className="mt-auto flex gap-2">
+        {previewing ? (
+          <button className={`${btn} border-fuchsia-400 text-fuchsia-100`} onClick={onStop}>
+            ■ Stopp
+          </button>
+        ) : (
+          <button className={btn} onClick={() => onPlay(0)}>
+            ▶ Anhören
+          </button>
+        )}
+        <button className={`${btn} border-cyan-500/70 bg-cyan-500/10 text-cyan-100`} onClick={onApply} title="Ersetzt die Clips in der Timeline (Strg+Z macht es rückgängig)">
+          ⤓ In Timeline übernehmen
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function PreviewHead({ duration }) {
+  const [pos, setPos] = useState(0)
+  useEffect(() => {
+    let raf
+    const loop = () => {
+      setPos(engine.position())
+      raf = requestAnimationFrame(loop)
+    }
+    loop()
+    return () => cancelAnimationFrame(raf)
+  }, [])
+  return (
+    <div className="pointer-events-none absolute top-0 h-10 w-0.5 bg-white shadow-[0_0_6px_white]" style={{ left: `${Math.min(100, (pos / duration) * 100)}%` }}>
+      <span className="absolute -top-4 -translate-x-1/2 rounded bg-zinc-100 px-1 font-mono text-[9px] text-zinc-900">{formatTime(pos).slice(0, -3)}</span>
+    </div>
+  )
+}

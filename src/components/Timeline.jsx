@@ -144,6 +144,30 @@ export default function Timeline({ state, dispatch, engine, playing, onSeek, onD
           ctx.fillRect(px, top, 1, Math.max(1, (Math.min(1, hi) - Math.max(-1, lo)) * amp))
         }
       }
+      // transition fades (mashup crossfades)
+      if (clip.fadeIn > 0 || clip.fadeOut > 0) {
+        const top = y + CLIP_HEADER
+        const bottom = y + ch
+        ctx.fillStyle = 'rgba(9,9,11,0.45)'
+        ctx.strokeStyle = 'rgba(250,250,250,0.7)'
+        ctx.lineWidth = 1
+        for (const [x0, x1, rising] of [
+          [x, x + (clip.fadeIn || 0) * z, true],
+          [x + cw - (clip.fadeOut || 0) * z, x + cw, false],
+        ]) {
+          if (x1 - x0 < 1) continue
+          ctx.beginPath()
+          ctx.moveTo(x0, rising ? bottom : top)
+          ctx.lineTo(x1, rising ? top : bottom)
+          ctx.lineTo(rising ? x0 : x1, top)
+          ctx.closePath()
+          ctx.fill()
+          ctx.beginPath()
+          ctx.moveTo(x0, rising ? bottom : top)
+          ctx.lineTo(x1, rising ? top : bottom)
+          ctx.stroke()
+        }
+      }
       ctx.restore()
     }
 
