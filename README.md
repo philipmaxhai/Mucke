@@ -5,6 +5,10 @@ Tab-Audio mitschneiden, im BPM-Grid schneiden und loopen, mit DJ-Effekten bearbe
 
 ## Starten
 
+Online (ohne Installation): https://philipmaxhai.github.io/Mucke/ – wird bei jedem Push per GitHub Actions neu gebaut.
+
+Lokal:
+
 ```bash
 npm install
 npm run dev      # http://localhost:5173
