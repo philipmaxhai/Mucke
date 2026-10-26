@@ -2,7 +2,32 @@
 
 const ANALYSIS_RATE = 22050
 
+// Limit parallel workers to the machine's cores (each job holds a few seconds of audio in memory).
+const MAX_WORKERS = Math.max(1, Math.min(6, (globalThis.navigator?.hardwareConcurrency || 4) - 1))
+let running = 0
+const queue = []
+
 function runJob(msg, transfer, onProgress) {
+  return new Promise((resolve, reject) => {
+    queue.push({ msg, transfer, onProgress, resolve, reject })
+    pump()
+  })
+}
+
+function pump() {
+  while (running < MAX_WORKERS && queue.length) {
+    const job = queue.shift()
+    running++
+    startJob(job.msg, job.transfer, job.onProgress)
+      .then(job.resolve, job.reject)
+      .finally(() => {
+        running--
+        pump()
+      })
+  }
+}
+
+function startJob(msg, transfer, onProgress) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' })
     worker.onmessage = (e) => {
@@ -47,4 +72,38 @@ export async function stretchBuffer(ctx, buffer, tempo, semis, onProgress) {
   const result = ctx.createBuffer(out.length, out[0].length, buffer.sampleRate)
   out.forEach((data, c) => result.copyToChannel(data, c))
   return result
+}
+
+// Cuts a loop region (song time, with padding) out of `buffer`, fits it to the target tempo/key and
+// splits it into drums / bass / music / air. Returns { stemName: AudioBuffer }.
+export async function loopStems(ctx, buffer, { start, end, padBefore, loopSeconds, tempo, semis, beatSec }, onProgress) {
+  const sr = buffer.sampleRate
+  const i0 = Math.max(0, Math.floor(start * sr))
+  const i1 = Math.min(buffer.length, Math.ceil(end * sr))
+  const channels = []
+  for (let c = 0; c < buffer.numberOfChannels; c++) channels.push(buffer.getChannelData(c).slice(i0, i1))
+  const padOut = padBefore / tempo
+  const beats = []
+  for (let t = padOut - 4 * beatSec; t < (i1 - i0) / sr / tempo; t += beatSec) if (t >= 0) beats.push(t)
+  const stems = await runJob(
+    {
+      type: 'stems',
+      channels,
+      sr,
+      tempo,
+      semis,
+      beats,
+      trimStart: Math.round(padOut * sr),
+      trimLength: Math.round(loopSeconds * sr),
+    },
+    channels.map((c) => c.buffer),
+    onProgress,
+  )
+  const out = {}
+  for (const [name, chans] of Object.entries(stems)) {
+    const b = ctx.createBuffer(chans.length, chans[0].length, sr)
+    chans.forEach((data, c) => b.copyToChannel(data, c))
+    out[name] = b
+  }
+  return out
 }
