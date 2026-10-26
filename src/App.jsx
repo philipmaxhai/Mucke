@@ -14,6 +14,23 @@ import { SNAP_OPTIONS, beatSec, initialState, reducer, snapTime, splitClip, uid 
 const btn =
   'inline-flex h-9 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-200 hover:border-zinc-500 disabled:opacity-40'
 
+function recordingErrorText(err, source) {
+  const msg = String(err?.message || err)
+  const mac = /Mac/i.test(navigator.platform || navigator.userAgent)
+  if (err?.name === 'NotAllowedError') {
+    if (/system/i.test(msg)) {
+      return mac
+        ? 'macOS blockiert die Aufnahme. Systemeinstellungen → Datenschutz & Sicherheit → Bildschirm- & Systemaudioaufnahme → Chrome erlauben, Chrome neu starten.'
+        : 'Das Betriebssystem blockiert die Aufnahme. Erlaube dem Browser die Bildschirmaufnahme in den Systemeinstellungen.'
+    }
+    return source === 'display'
+      ? 'Freigabe abgebrochen. Klick nochmal auf „Tab-Audio“, wähle oben den Reiter „Chrome-Tab“, dann den Tab mit der Musik, setz unten den Haken „Tab-Audio teilen“ und klick „Teilen“.'
+      : 'Mikrofon nicht erlaubt. Klick links in der Adressleiste aufs Schloss-Symbol und erlaube das Mikrofon.'
+  }
+  if (err?.name === 'NotFoundError') return 'Kein Aufnahmegerät gefunden.'
+  return msg
+}
+
 export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, initialState)
   const [playing, setPlaying] = useState(false)
@@ -222,8 +239,7 @@ export default function App() {
       recRef.current = { source, handle, trackId: stateRef.current.selectedTrackId }
       setRec(recRef.current)
     } catch (err) {
-      if (err?.name === 'NotAllowedError') notify('Aufnahme abgebrochen oder nicht erlaubt.', 'error')
-      else notify(err?.message || String(err), 'error')
+      notify(recordingErrorText(err, source), 'error')
     }
   }
 
