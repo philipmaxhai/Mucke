@@ -36,7 +36,7 @@ async function openStream(source) {
     // Chrome only offers audio together with video, so we ask for both and drop the picture.
     const stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: 1 },
-      audio: RAW_AUDIO,
+      audio: { ...RAW_AUDIO, suppressLocalAudioPlayback: false },
       systemAudio: 'include',
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'include',
