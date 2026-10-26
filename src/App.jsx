@@ -259,7 +259,7 @@ export default function App() {
         },
       })
       dispatch({ type: 'setClips', record: true, clips })
-      notify('Mashup ist in der Timeline. Jeder Teil ist ein normaler Clip: verschieben, trimmen, Effekte pro Song-Spur. Strg+Z macht es rückgängig.')
+      notify('Ist jetzt in der Timeline. Jeder Teil ist ein normaler Clip: verschieben, trimmen, Effekte pro Spur. Strg+Z macht es rückgängig.')
     },
     [ensureAudio, notify, stopTransport],
   )

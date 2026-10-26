@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { DEFAULT_FX } from '../audio/fx.js'
 import { engine } from '../audio/engine.js'
 import { LENGTHS, buildArrangement, planSongs, suggest } from '../mashup/arrange.js'
-import { analyzeBuffer, stretchBuffer } from '../mashup/client.js'
+import { analyzeBuffer, loopStems, stretchBuffer } from '../mashup/client.js'
 import { ALL_KEYS, camelotLabel, keyName } from '../mashup/keys.js'
+import { ROLES, TEMPLATES, TRACKS, buildNewSong, impactSamples, pickRegions, riserSamples, suggestNewSongs } from '../mashup/newsong.js'
 import { formatTime, uid } from '../state/project.js'
 
 const MAX_SONGS = 4
@@ -38,15 +39,43 @@ export function mashupTracks(plan, layerSongs = new Set()) {
   }))
 }
 
+export function newSongTracks(clips) {
+  return TRACKS.filter((t) => clips.some((c) => c.trackId === t.id)).map((t) => ({
+    id: t.id,
+    name: t.name,
+    color: t.color,
+    mute: false,
+    solo: false,
+    fx: { ...DEFAULT_FX },
+  }))
+}
+
+const rms = (buffer) => {
+  let e = 0
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    const d = buffer.getChannelData(c)
+    for (let i = 0; i < d.length; i += 4) e += d[i] * d[i]
+  }
+  return Math.sqrt(e / ((buffer.length / 4) * buffer.numberOfChannels))
+}
+
+function toBuffer(ctx, channels) {
+  const b = ctx.createBuffer(channels.length, channels[0].length, ctx.sampleRate)
+  channels.forEach((d, c) => b.copyToChannel(d, c))
+  return b
+}
+
 export default function MashupStudio({ open, onClose, state, notify, onApply, stopTransport }) {
   const [songs, setSongs] = useState([])
-  const [settings, setSettings] = useState({ baseId: null, bpm: '', matchKey: true, length: 'mittel' })
+  const [settings, setSettings] = useState({ mode: 'song', baseId: null, bpm: '', matchKey: true, length: 'mittel' })
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(null)
   const [audition, setAudition] = useState(null)
   const [preview, setPreview] = useState(null)
   const [dragOver, setDragOver] = useState(false)
   const stretched = useRef(new Map())
+  const library = useRef(new Map())
+  const fxBuffers = useRef(null)
   const auditionRef = useRef(null)
   const previewRef = useRef(null)
   const fileInput = useRef(null)
@@ -57,7 +86,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
   const baseId = ready.some((s) => s.id === settings.baseId) ? settings.baseId : ready[0]?.id
   const base = ready.find((s) => s.id === baseId)
   const targetBpm = Number(settings.bpm) >= 60 && Number(settings.bpm) <= 200 ? Number(settings.bpm) : base ? base.analysis.bpm : 124
-  const signature = JSON.stringify([ready.map((s) => [s.id, s.key, s.excluded]), baseId, targetBpm, settings.matchKey, settings.length])
+  const signature = JSON.stringify([ready.map((s) => [s.id, s.key, s.excluded]), baseId, targetBpm, settings.matchKey, settings.length, settings.mode])
   const stale = result && result.signature !== signature
 
   const updateSong = useCallback((id, patch) => setSongs((list) => list.map((s) => (s.id === id ? { ...s, ...patch } : s))), [])
@@ -128,8 +157,9 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
     stopTransport()
     const savedOnStop = previewRef.current ? previewRef.current.savedOnStop : engine.onStop
     engine.ensure()
-    const tracks = mashupTracks(result.plan, sug.arrangement.layerSongs)
-    engine.syncTracks([...stateRef.current.tracks.map((t) => ({ ...t, mute: true, solo: false })), ...tracks], result.targetBpm)
+    const tracks = sug.tracks
+    const own = stateRef.current.tracks.filter((t) => !tracks.some((x) => x.id === t.id))
+    engine.syncTracks([...own.map((t) => ({ ...t, mute: true, solo: false })), ...tracks], result.targetBpm)
     previewRef.current = { key: sug.key, savedOnStop }
     engine.onStop = () => stopPreview()
     engine.play({ clips: sug.arrangement.clips, bpm: result.targetBpm, loop: { enabled: false, start: 0, end: 0 }, metronome: false }, from)
@@ -197,6 +227,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
       ready.map((s) => ({ ...s, analysis: { ...s.analysis, key: s.key } })),
       { targetBpm, baseId, matchKey: settings.matchKey },
     )
+    if (settings.mode === 'song') return generateSong(seed, plan)
     try {
       const ctx = engine.ensure()
       const progress = new Map()
@@ -235,7 +266,8 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
           makeId: () => uid('c'),
         }),
       }))
-      setResult({ plan, targetBpm, suggestions, seed, signature })
+      for (const sug of suggestions) sug.tracks = mashupTracks(plan.filter((s) => sug.songs.includes(s.id)), sug.arrangement.layerSongs)
+      setResult({ mode: 'mashup', plan, targetBpm, suggestions, seed, signature })
     } catch (err) {
       notify(`Anpassen fehlgeschlagen: ${err?.message || err}`, 'error')
     } finally {
@@ -243,10 +275,115 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
     }
   }
 
+  const freeBuffer = (id, keep) => {
+    if (keep.has(id) || stateRef.current.clips.some((c) => c.bufferId === id)) return
+    engine.buffers.delete(id)
+    engine.peaks.delete(id)
+  }
+
+  // "Neuer Song": cut loops from every song, fit them to tempo/key, split them into layers, recombine.
+  const generateSong = async (seed, plan) => {
+    try {
+      const ctx = engine.ensure()
+      const barLen = 240 / targetBpm
+      const jobs = []
+      const fresh = new Map()
+      const progress = new Map()
+      const report = () =>
+        setBusy({
+          text: 'Passe Tempo und Tonart an und zerlege die Songs in Drums, Bass, Melodie und Atmo …',
+          p: progress.size ? [...progress.values()].reduce((x, y) => x + y, 0) / progress.size : 1,
+        })
+      for (const song of plan) {
+        const regions = pickRegions(song)
+        const key = JSON.stringify([song.tempo.toFixed(5), song.semis, regions])
+        const cached = library.current.get(song.id)
+        if (cached?.key === key) {
+          fresh.set(song.id, cached)
+          continue
+        }
+        const entry = { key, regions: {} }
+        fresh.set(song.id, entry)
+        const a = song.analysis
+        const done = new Map()
+        for (const [type, region] of Object.entries(regions)) {
+          if (!region) continue
+          const id = `${region.startBar}:${region.bars}`
+          if (done.has(id)) {
+            jobs.push(done.get(id).then((stems) => (entry.regions[type] = stems)))
+            continue
+          }
+          const loopStart = a.downbeat + region.startBar * a.barLen
+          const start = Math.max(0, loopStart - a.barLen)
+          const job = loopStems(
+            ctx,
+            engine.buffers.get(song.bufferId),
+            {
+              start,
+              end: Math.min(a.duration, loopStart + (region.bars + 1) * a.barLen),
+              padBefore: loopStart - start,
+              loopSeconds: region.bars * barLen,
+              tempo: song.tempo,
+              semis: song.semis,
+              beatSec: barLen / 4,
+            },
+            (p) => {
+              progress.set(`${song.id}:${id}`, p)
+              report()
+            },
+          ).then((buffers) => {
+            const total = Math.sqrt(Object.values(buffers).reduce((s, b) => s + rms(b) ** 2, 0))
+            const stems = {}
+            for (const [name, buffer] of Object.entries(buffers)) {
+              const bufferId = uid('b')
+              engine.addBuffer(bufferId, buffer)
+              const level = rms(buffer)
+              stems[name] = { bufferId, rms: level, present: level > 0.003 && level > 0.12 * total, bars: region.bars, energy: region.energy }
+            }
+            return stems
+          })
+          done.set(id, job)
+          progress.set(`${song.id}:${id}`, 0)
+          jobs.push(job.then((stems) => (entry.regions[type] = stems)))
+        }
+      }
+      report()
+      await Promise.all(jobs)
+
+      // free stems of older versions
+      const keep = new Set()
+      for (const entry of fresh.values()) for (const r of Object.values(entry.regions)) for (const st of Object.values(r)) keep.add(st.bufferId)
+      for (const [id, entry] of library.current) {
+        if (fresh.get(id) === entry) continue
+        for (const r of Object.values(entry.regions)) for (const st of Object.values(r)) freeBuffer(st.bufferId, keep)
+      }
+      library.current = fresh
+
+      if (fxBuffers.current?.bpm !== targetBpm) {
+        if (fxBuffers.current) for (const id of [fxBuffers.current.riserId, fxBuffers.current.impactId]) freeBuffer(id, new Set())
+        const riserId = uid('b')
+        const impactId = uid('b')
+        engine.addBuffer(riserId, toBuffer(ctx, riserSamples(ctx.sampleRate, 8 * barLen)))
+        engine.addBuffer(impactId, toBuffer(ctx, impactSamples(ctx.sampleRate, 2 * barLen)))
+        fxBuffers.current = { bpm: targetBpm, riserId, impactId }
+      }
+
+      const lib = new Map([...fresh].map(([id, e]) => [id, e.regions]))
+      const suggestions = suggestNewSongs(plan, lib, { seed }).map((sug) => {
+        const arrangement = buildNewSong(sug, lib, { targetBpm, length: settings.length, makeId: () => uid('c'), extras: fxBuffers.current })
+        return { ...sug, arrangement, tracks: newSongTracks(arrangement.clips) }
+      })
+      setResult({ mode: 'song', plan, targetBpm, suggestions, seed, signature })
+    } catch (err) {
+      notify(`Neuer Song fehlgeschlagen: ${err?.message || err}`, 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const apply = (sug) => {
     stopPreview()
-    const used = result.plan.filter((s) => sug.songs.includes(s.id))
-    onApply({ tracks: mashupTracks(used, sug.arrangement.layerSongs), clips: sug.arrangement.clips, bpm: result.targetBpm })
+    onApply({ tracks: sug.tracks, clips: sug.arrangement.clips, bpm: result.targetBpm })
     onClose()
   }
 
@@ -274,7 +411,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
           <div className="min-w-0 flex-1">
             <h2 className="text-lg font-bold text-zinc-100">✨ Mashup-Studio</h2>
             <p className="text-xs leading-relaxed text-zinc-400">
-              Lade 2–4 Songs. Die App erkennt Tempo, Tonart und Abschnitte, passt alles aneinander an und schlägt dir fertige Mashups vor.
+              Lade 2–4 Songs. Die App erkennt Tempo, Tonart und Abschnitte, passt alles aneinander an und baut daraus Vorschläge für einen neuen Song.
               Alles läuft lokal in deinem Browser, ohne Cloud und ohne Kosten.
             </p>
           </div>
@@ -350,6 +487,21 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
           {/* 2. settings */}
           <section>
             <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-zinc-500">2 · Anpassen</h3>
+            <div className="mb-3 grid gap-2 sm:grid-cols-2">
+              {[
+                ['song', '🎹 Neuer Song', 'Zerlegt die Songs in Drums, Bass, Melodie und Atmo und lässt sie gleichzeitig zusammenspielen, in einem eigenen Ablauf.'],
+                ['mashup', '🔀 Mashup', 'Reiht ganze Teile der Songs aneinander, wie ein DJ-Mix mit Übergängen.'],
+              ].map(([mode, title, text]) => (
+                <button
+                  key={mode}
+                  className={`rounded-lg border p-3 text-left ${settings.mode === mode ? 'border-fuchsia-400 bg-fuchsia-500/10' : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-600'}`}
+                  onClick={() => setSettings((s) => ({ ...s, mode }))}
+                >
+                  <div className="text-sm font-semibold text-zinc-100">{title}</div>
+                  <div className="text-xs leading-relaxed text-zinc-400">{text}</div>
+                </button>
+              ))}
+            </div>
             <div className="flex flex-wrap items-end gap-3">
               <label className="flex flex-col gap-1 text-xs text-zinc-400">
                 Ziel-Tempo
@@ -371,7 +523,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
                 Länge
                 <span className="flex">
                   {Object.keys(LENGTHS).map((l, i) => {
-                    const bars = LENGTHS[l].reduce((a, s) => a + s[1], 0)
+                    const bars = settings.mode === 'song' ? TEMPLATES[l].reduce((a, s) => a + s.bars, 0) : LENGTHS[l].reduce((a, s) => a + s[1], 0)
                     return (
                       <button
                         key={l}
@@ -396,7 +548,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
                   </button>
                 )}
                 <button className={primary} onClick={() => generate(result && !stale ? result.seed : 1)} disabled={!ready.length || !!busy}>
-                  ✨ {result ? 'Vorschläge neu erzeugen' : 'Mashup-Vorschläge erzeugen'}
+                  ✨ {result ? 'Vorschläge neu erzeugen' : settings.mode === 'song' ? 'Neue Songs vorschlagen' : 'Mashup-Vorschläge erzeugen'}
                 </button>
               </div>
             </div>
@@ -421,6 +573,7 @@ export default function MashupStudio({ open, onClose, state, notify, onApply, st
               <div className={`grid gap-3 lg:grid-cols-2 ${stale ? 'opacity-50' : ''}`}>
                 {result.suggestions.map((sug) => (
                   <SuggestionCard
+                    Card={result.mode === 'song' ? NewSongCard : null}
                     key={sug.key}
                     sug={sug}
                     plan={result.plan}
@@ -548,7 +701,88 @@ function EnergyLine({ values }) {
   )
 }
 
-function SuggestionCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
+function SuggestionCard({ Card, ...props }) {
+  return Card ? <Card {...props} /> : <MashupCard {...props} />
+}
+
+function NewSongCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
+  const songOf = (id) => plan.find((s) => s.id === id)
+  const { sections, duration, clips } = sug.arrangement
+  const total = sections.reduce((a, s) => a + s.bars, 0)
+  const rows = [...ROLES.filter((r) => clips.some((c) => c.role === r.key)), { key: 'fx', label: 'Riser / FX' }]
+  return (
+    <div className={`flex min-w-0 flex-col gap-3 rounded-lg border bg-zinc-900/60 p-3 ${previewing ? 'border-fuchsia-400' : 'border-zinc-800'}`}>
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate font-semibold text-zinc-100">{sug.title}</span>
+        <span className="text-xs text-zinc-500">{formatTime(duration).slice(0, -3)}</span>
+        <span className="rounded bg-lime-400/15 px-2 py-0.5 text-xs font-semibold text-lime-300" title="Wie gut die Schichten harmonisch und rhythmisch zusammenpassen">
+          {sug.score} % Match
+        </span>
+      </div>
+      <div
+        className="relative cursor-pointer"
+        onClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect()
+          onPlay(Math.max(0, ((e.clientX - r.left - 64) / (r.width - 64)) * duration))
+        }}
+        title="Klick: ab hier anhören"
+      >
+        <div className="flex text-[9px] text-zinc-500">
+          <span className="w-16 shrink-0" />
+          {sections.map((sec, i) => (
+            <span key={i} className="min-w-0 truncate px-0.5" style={{ flexGrow: sec.bars, flexBasis: 0 }}>
+              {sec.name}
+            </span>
+          ))}
+        </div>
+        {rows.map((row) => (
+          <div key={row.key} className="mt-px flex h-4 items-center">
+            <span className="w-16 shrink-0 truncate pr-1 text-[9px] text-zinc-400">{row.label}</span>
+            {sections.map((sec, i) => {
+              const clip = clips.find((c) => c.role === row.key && c.start >= sec.start * (duration / total) - 0.01 && c.start < (sec.start + sec.bars) * (duration / total) - 0.01)
+              const song = clip?.songId ? songOf(clip.songId) : null
+              return (
+                <span
+                  key={i}
+                  className="mr-px h-full min-w-0 overflow-hidden text-center text-[9px] font-bold leading-4 text-zinc-950"
+                  style={{ flexGrow: sec.bars, flexBasis: 0, background: clip ? (song ? song.color : '#94a3b8') : 'rgba(255,255,255,0.04)', opacity: clip && clip.gain < 0.05 ? 0.6 : 1 }}
+                >
+                  {song?.letter ?? ''}
+                </span>
+              )
+            })}
+          </div>
+        ))}
+        {previewing && <PreviewHead duration={duration} inset={64} height={16 + rows.length * 17} />}
+        <div className="mt-1 flex justify-between pl-16 text-[10px] text-zinc-500">
+          <span>{total} Takte</span>
+          <span>{bpm} BPM</span>
+        </div>
+      </div>
+      <ul className="space-y-1 text-xs leading-relaxed text-zinc-400">
+        {sug.notes.map((n, i) => (
+          <li key={i}>• {n}</li>
+        ))}
+      </ul>
+      <div className="mt-auto flex gap-2">
+        {previewing ? (
+          <button className={`${btn} border-fuchsia-400 text-fuchsia-100`} onClick={onStop}>
+            ■ Stopp
+          </button>
+        ) : (
+          <button className={btn} onClick={() => onPlay(0)}>
+            ▶ Anhören
+          </button>
+        )}
+        <button className={`${btn} border-cyan-500/70 bg-cyan-500/10 text-cyan-100`} onClick={onApply} title="Ersetzt die Clips in der Timeline (Strg+Z macht es rückgängig)">
+          ⤓ In Timeline übernehmen
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function MashupCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply }) {
   const songOf = (id) => plan.find((s) => s.id === id)
   const total = sug.slots.reduce((a, s) => a + s.bars, 0)
   const duration = sug.arrangement.duration
@@ -620,7 +854,7 @@ function SuggestionCard({ sug, plan, bpm, previewing, onPlay, onStop, onApply })
   )
 }
 
-function PreviewHead({ duration }) {
+function PreviewHead({ duration, inset = 0, height = 40 }) {
   const [pos, setPos] = useState(0)
   useEffect(() => {
     let raf
@@ -632,7 +866,10 @@ function PreviewHead({ duration }) {
     return () => cancelAnimationFrame(raf)
   }, [])
   return (
-    <div className="pointer-events-none absolute top-0 h-10 w-0.5 bg-white shadow-[0_0_6px_white]" style={{ left: `${Math.min(100, (pos / duration) * 100)}%` }}>
+    <div
+      className="pointer-events-none absolute top-0 w-0.5 bg-white shadow-[0_0_6px_white]"
+      style={{ height, left: `calc(${inset}px + (100% - ${inset}px) * ${Math.min(1, pos / duration)})` }}
+    >
       <span className="absolute -top-4 -translate-x-1/2 rounded bg-zinc-100 px-1 font-mono text-[9px] text-zinc-900">{formatTime(pos).slice(0, -3)}</span>
     </div>
   )
