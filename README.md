@@ -35,6 +35,7 @@ npm run build    # statischer Build in dist/
 - Ganzer Bildschirm mit **Systemaudio** geht unter Windows und ChromeOS. Unter macOS je nach Chrome-/macOS-Version
   meist nur Tab-Audio – für Systemsound dort ein Loopback-Tool (z. B. BlackHole) als Mikrofon nutzen.
 - Die Aufnahme endet mit „Stopp“ oder wenn du in der Browserleiste „Freigabe beenden“ klickst.
+- **Spotify, Apple Music, Netflix & Co. sind kopiergeschützt (DRM):** Chrome gibt deren Ton beim Teilen nur als Stille weiter. Mucke erkennt stumme Aufnahmen und sagt Bescheid. YouTube, SoundCloud, Bandcamp-Previews oder eigene Dateien funktionieren.
 - Nimm nur Material auf, an dem du die Rechte hast bzw. das du privat nutzen darfst.
 
 ## Tastatur

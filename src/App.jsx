@@ -6,13 +6,16 @@ import { downloadBlob } from './audio/wav.js'
 import ClipInspector from './components/ClipInspector.jsx'
 import FxPanel from './components/FxPanel.jsx'
 import Knob from './components/Knob.jsx'
-import { LevelMeter, PositionDisplay, RecTimer } from './components/Meters.jsx'
+import { LevelMeter, PositionDisplay, RecTimer, SilenceHint } from './components/Meters.jsx'
 import Timeline from './components/Timeline.jsx'
 import TrackHeaders from './components/TrackHeaders.jsx'
 import { SNAP_OPTIONS, beatSec, initialState, reducer, snapTime, splitClip, uid } from './state/project.js'
 
 const btn =
   'inline-flex h-9 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-200 hover:border-zinc-500 disabled:opacity-40'
+
+const SILENT_RECORDING =
+  'Die Aufnahme war komplett stumm und wurde verworfen. Spotify, Apple Music, Netflix & Co. sind kopiergeschützt (DRM): Der Browser gibt ihren Ton beim Teilen nur als Stille weiter. Das lässt sich nicht umgehen. Nimm stattdessen YouTube, SoundCloud, Bandcamp-Previews oder eigene Dateien (Import).'
 
 function recordingErrorText(err, source) {
   const msg = String(err?.message || err)
@@ -222,8 +225,11 @@ export default function App() {
     if (!current) return
     recRef.current = null
     setRec(null)
+    const hasSignal = current.handle.hasSignal()
     const buffer = current.handle.stop()
-    if (buffer && buffer.duration > 0.05) {
+    if (buffer && !hasSignal) {
+      notify(SILENT_RECORDING, 'error')
+    } else if (buffer && buffer.duration > 0.05) {
       recCount.current += 1
       const label = current.source === 'display' ? 'Tab-Rec' : 'Mic-Rec'
       addBufferClip(buffer, `${label} ${recCount.current}`, current.trackId)
@@ -402,6 +408,7 @@ export default function App() {
             <div className="flex h-9 items-center gap-2 rounded-md border border-rose-500 bg-rose-500/10 px-3 text-sm text-rose-200">
               <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" />
               REC <RecTimer handle={rec.handle} />
+              <SilenceHint handle={rec.handle} />
               <LevelMeter read={readRec} className="w-16" />
               <button className="ml-1 rounded bg-rose-500 px-2 py-0.5 text-xs font-semibold text-white hover:bg-rose-400" onClick={finishRecording}>
                 Stopp

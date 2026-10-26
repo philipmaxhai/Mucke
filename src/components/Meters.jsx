@@ -59,3 +59,18 @@ export function RecTimer({ handle }) {
   }, [handle])
   return <span className="font-mono">{formatTime(sec)}</span>
 }
+
+// Shown when a recording has run for a few seconds without any signal (e.g. DRM-protected tabs).
+export function SilenceHint({ handle }) {
+  const [silent, setSilent] = useState(false)
+  useEffect(() => {
+    const id = setInterval(() => setSilent(handle.seconds() > 3 && !handle.hasSignal()), 500)
+    return () => clearInterval(id)
+  }, [handle])
+  if (!silent) return null
+  return (
+    <span className="text-xs text-amber-300" title="Kopiergeschützte Seiten wie Spotify liefern beim Teilen nur Stille">
+      kein Signal – läuft Musik? (Spotify = stumm, DRM)
+    </span>
+  )
+}

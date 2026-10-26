@@ -22,6 +22,9 @@ function loadWorklet(ctx) {
   return workletReady
 }
 
+// about -80 dBFS: anything quieter counts as digital silence
+const SILENCE = 1e-4
+
 const RAW_AUDIO = { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
 
 export function displayCaptureSupported() {
@@ -73,11 +76,13 @@ export async function startRecording(ctx, source, { onEnded } = {}) {
   const left = []
   const right = []
   let frames = 0
+  let peak = 0
   node.port.onmessage = (e) => {
     const [l, r] = e.data
     left.push(l)
     right.push(r || l)
     frames += l.length
+    if (peak < SILENCE) for (const ch of e.data) for (const v of ch) if (Math.abs(v) > peak) peak = Math.abs(v)
   }
 
   input.connect(node)
@@ -113,6 +118,8 @@ export async function startRecording(ctx, source, { onEnded } = {}) {
   return {
     stop,
     seconds: () => frames / ctx.sampleRate,
+    // false while nothing above the noise floor has arrived yet
+    hasSignal: () => peak >= SILENCE,
     level() {
       const data = new Float32Array(analyser.fftSize)
       analyser.getFloatTimeDomainData(data)
