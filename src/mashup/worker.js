@@ -19,7 +19,7 @@ self.onmessage = (e) => {
       // loop region with one bar of padding on both sides: stretch, separate, then trim to the loop
       const { sr, tempo, semis, beats, trimStart, trimLength } = e.data
       const stretched = stretchChannels(e.data.channels, sr, tempo, semis, (p) => progress(0.3 * p))
-      const stems = separateStems(stretched, sr, beats, (p) => progress(0.3 + 0.7 * p))
+      const stems = separateStems(stretched, sr, beats, (p) => progress(0.3 + 0.7 * p), e.data.clarity ?? 0.6)
       const result = {}
       const transfer = []
       for (const [name, chans] of Object.entries(stems)) {
