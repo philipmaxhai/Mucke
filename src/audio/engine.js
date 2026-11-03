@@ -1,6 +1,8 @@
 import { createFxChain, createMaster, trackAudible } from './fx.js'
 import { computePeaks } from './peaks.js'
 import { schedulePart, songEnd } from './schedule.js'
+import { expandClips } from './patterns.js'
+import { playChannel } from './instruments.js'
 
 const LOOKAHEAD = 0.35
 const START_DELAY = 0.05
@@ -57,6 +59,9 @@ class Engine {
       if (!chain) {
         chain = createFxChain(ctx)
         chain.output.connect(this.master.input)
+        chain.meter = ctx.createAnalyser()
+        chain.meter.fftSize = 512
+        chain.output.connect(chain.meter)
         this.chains.set(t.id, chain)
       }
       chain.apply(t.fx, bpm, trackAudible(t, tracks))
@@ -83,6 +88,7 @@ class Engine {
     this.segments = []
     this.nextTl = pos
     this.nextCtx = ctx.currentTime + START_DELAY
+    this.expanded = expandClips(project.clips, project.channels ?? [])
     this.end = songEnd(project.clips)
     this.beatSec = 60 / project.bpm
     this.nextClickBeat = Math.ceil(pos / this.beatSec - 1e-6)
@@ -93,7 +99,8 @@ class Engine {
   }
 
   scheduleChunk() {
-    const { loop, clips } = this.project
+    const { loop } = this.project
+    const clips = this.expanded
     const tlStart = this.nextTl
     const tlEnd = this.looping ? loop.end : Infinity
     const ctxStart = this.nextCtx
@@ -198,10 +205,32 @@ class Engine {
     return pos
   }
 
+  // Plays one note of a channel right now (channel rack / piano roll audition).
+  preview(ch, pitch = null, dur = 0.25) {
+    const ctx = this.ensure()
+    const chain = this.chains.get(ch.insertId)
+    const g = ctx.createGain()
+    g.gain.value = ch.volume ?? 0.8
+    const pan = ctx.createStereoPanner()
+    pan.pan.value = ch.pan ?? 0
+    g.connect(pan)
+    pan.connect(chain ? chain.input : this.master.input)
+    playChannel(ctx, ch, g, ctx.currentTime + 0.005, dur, pitch, 0.9, this.buffers)
+    setTimeout(() => pan.disconnect(), (dur + 2) * 1000)
+  }
+
+  trackLevel(id) {
+    return this.peakOf(this.chains.get(id)?.meter)
+  }
+
   level() {
-    if (!this.analyser) return 0
-    const data = new Float32Array(this.analyser.fftSize)
-    this.analyser.getFloatTimeDomainData(data)
+    return this.peakOf(this.analyser)
+  }
+
+  peakOf(analyser) {
+    if (!analyser) return 0
+    const data = new Float32Array(analyser.fftSize)
+    analyser.getFloatTimeDomainData(data)
     let peak = 0
     for (const v of data) peak = Math.max(peak, Math.abs(v))
     return peak

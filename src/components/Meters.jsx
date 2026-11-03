@@ -70,7 +70,7 @@ export function SilenceHint({ handle }) {
   if (!silent) return null
   return (
     <span className="text-xs text-amber-300" title="Kopiergeschützte Seiten wie Spotify liefern beim Teilen nur Stille">
-      kein Signal – läuft Musik? (Spotify = stumm, DRM)
+      {handle.multi ? 'kein Signal – spielt die App gerade?' : 'kein Signal – läuft Musik? (Spotify = stumm, DRM)'}
     </span>
   )
 }

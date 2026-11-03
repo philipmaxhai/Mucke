@@ -1,0 +1,53 @@
+name: Windows desktop app
+
+# Builds Mucke.exe (portable) and a zip on a Windows runner. Download them from the run's "Artifacts".
+# Pushing a tag like v0.2.0 also attaches them to a GitHub release.
+on:
+  push:
+    branches: [main, claude/project-thread-lumaak, claude/project-thread-kzy1t8]
+    tags: ['v*']
+    paths: ['src/**', 'desktop/**', 'index.html', 'package.json', '.github/workflows/desktop.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build loopback helper
+        working-directory: desktop/native
+        run: cl /nologo /O2 /EHsc /std:c++17 /MT mucke-loopback.cpp ole32.lib mmdevapi.lib uuid.lib psapi.lib /Fe:mucke-loopback.exe
+
+      - name: Package Electron app
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mucke-Windows
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.zip
+          if-no-files-found: error
+
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop/dist/*.exe
+            desktop/dist/*.zip

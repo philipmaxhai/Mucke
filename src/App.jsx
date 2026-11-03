@@ -1,16 +1,49 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { engine } from './audio/engine.js'
+import { PatternRenderer, mixBufferId, patternDuration } from './audio/patterns.js'
 import { renderProject } from './audio/export.js'
 import { displayCaptureSupported, startRecording } from './audio/recorder.js'
 import { downloadBlob } from './audio/wav.js'
+import ChannelRack from './components/ChannelRack.jsx'
 import ClipInspector from './components/ClipInspector.jsx'
+import Mixer from './components/Mixer.jsx'
+import PianoRoll from './components/PianoRoll.jsx'
 import FxPanel from './components/FxPanel.jsx'
 import Knob from './components/Knob.jsx'
+import DesktopRecordDialog from './components/DesktopRecordDialog.jsx'
 import MashupStudio from './components/MashupStudio.jsx'
+import { desktopApi, startDesktopRecording } from './audio/desktop.js'
 import { LevelMeter, PositionDisplay, RecTimer, SilenceHint } from './components/Meters.jsx'
 import Timeline from './components/Timeline.jsx'
 import TrackHeaders from './components/TrackHeaders.jsx'
-import { SNAP_OPTIONS, beatSec, initialState, reducer, snapTime, splitClip, uid } from './state/project.js'
+import { SNAP_OPTIONS, beatSec, initialState, makeChannel, makeTrack, reducer, snapTime, splitClip, uid } from './state/project.js'
+
+const DOCKS = [
+  { id: 'rack', label: 'Channel Rack', key: 'F6' },
+  { id: 'piano', label: 'Piano Roll', key: 'F7' },
+  { id: 'mixer', label: 'Mixer', key: 'F9' },
+  { id: 'fx', label: 'Clip & FX', key: 'F8' },
+]
+
+// What the transport plays: in PAT mode the current pattern loops on its own, in SONG mode the playlist plays.
+function playProject(s) {
+  if (s.mode !== 'pattern') return s
+  const pattern = s.patterns.find((p) => p.id === s.currentPatternId) ?? s.patterns[0]
+  const length = patternDuration(pattern, s.bpm)
+  const clip = {
+    id: 'patloop',
+    patternId: pattern.id,
+    bufferId: mixBufferId(pattern.id),
+    trackId: s.tracks[0].id,
+    name: pattern.name,
+    start: 0,
+    offset: 0,
+    length,
+    rate: 1,
+    gain: 1,
+  }
+  return { ...s, clips: [clip], loop: { enabled: true, start: 0, end: length } }
+}
 
 const btn =
   'inline-flex h-9 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-200 hover:border-zinc-500 disabled:opacity-40'
@@ -42,6 +75,8 @@ export default function App() {
   const [toast, setToast] = useState(null)
   const [exporting, setExporting] = useState(false)
   const [mashupOpen, setMashupOpen] = useState(false)
+  const [desktopOpen, setDesktopOpen] = useState(false)
+  const isDesktop = !!desktopApi()
   const mashupOpenRef = useRef(false)
   mashupOpenRef.current = mashupOpen
   const playingRef = useRef(false)
@@ -53,6 +88,11 @@ export default function App() {
   const recRef = useRef(null)
   const taps = useRef([])
   const fileInput = useRef(null)
+  const sampleInput = useRef(null)
+  const renderer = useRef(null)
+  const patternDurs = useRef(new Map())
+  const [renderTick, setRenderTick] = useState(0)
+  const [samples, setSamples] = useState([])
 
   const notify = useCallback((msg, kind = 'info') => {
     setToast({ msg, kind, id: Date.now() })
@@ -87,12 +127,53 @@ export default function App() {
     }
   }, [])
 
+  // --- patterns ----------------------------------------------------------------
+
+  // Pattern clips follow their pattern's length (bars / tempo changes).
+  useEffect(() => {
+    const s = stateRef.current
+    let clips = s.clips
+    for (const p of s.patterns) {
+      const dur = patternDuration(p, s.bpm)
+      const old = patternDurs.current.get(p.id)
+      patternDurs.current.set(p.id, dur)
+      if (old === undefined || Math.abs(old - dur) < 1e-6) continue
+      clips = clips.map((c) =>
+        c.patternId !== p.id ? c : { ...c, length: Math.abs(c.length - old) < 1e-3 ? dur - c.offset : Math.min(c.length, dur - c.offset) },
+      )
+    }
+    if (clips !== s.clips) dispatch({ type: 'setClips', clips })
+  }, [state.patterns, state.bpm])
+
+  // Render patterns to audio whenever steps, notes, sounds or tempo change.
+  useEffect(() => {
+    if (!renderer.current) renderer.current = new PatternRenderer(engine)
+    const id = setTimeout(async () => {
+      const s = stateRef.current
+      const done = await renderer.current.update(s.patterns, s.channels, s.bpm)
+      if (done) setRenderTick((n) => n + 1)
+    }, 60)
+    return () => clearTimeout(id)
+  }, [state.patterns, state.channels, state.bpm, samples])
+
   // Re-schedule while playing when the arrangement changes (debounced so drags stay smooth).
   useEffect(() => {
     if (!engine.playing) return
-    const id = setTimeout(() => engine.play(stateRef.current, engine.position()), 90)
+    const id = setTimeout(() => engine.play(playProject(stateRef.current), engine.position()), 90)
     return () => clearTimeout(id)
-  }, [state.clips, state.loop, state.bpm, state.metronome])
+  }, [state.clips, state.loop, state.bpm, state.metronome, state.channels, state.tracks, renderTick])
+
+  // Switching PAT/SONG or the pattern while playing restarts at the right place.
+  const firstMode = useRef(true)
+  useEffect(() => {
+    if (firstMode.current) {
+      firstMode.current = false
+      return
+    }
+    if (!engine.playing) return
+    const s = stateRef.current
+    engine.play(playProject(s), s.mode === 'pattern' ? 0 : s.playhead)
+  }, [state.mode, state.currentPatternId])
 
   // --- transport -----------------------------------------------------------
 
@@ -100,7 +181,7 @@ export default function App() {
     (from) => {
       ensureAudio()
       playFrom.current = from
-      engine.play(stateRef.current, from)
+      engine.play(playProject(stateRef.current), stateRef.current.mode === 'pattern' ? 0 : from)
       setPlaying(true)
     },
     [ensureAudio],
@@ -110,7 +191,7 @@ export default function App() {
     if (engine.playing) {
       const pos = engine.stop()
       setPlaying(false)
-      dispatch({ type: 'set', patch: { playhead: pos } })
+      if (stateRef.current.mode === 'song') dispatch({ type: 'set', patch: { playhead: pos } })
     } else {
       play(stateRef.current.playhead)
     }
@@ -120,13 +201,14 @@ export default function App() {
     const wasPlaying = engine.playing
     engine.stop()
     setPlaying(false)
+    if (stateRef.current.mode === 'pattern') return
     dispatch({ type: 'set', patch: { playhead: wasPlaying ? playFrom.current : 0 } })
   }, [])
 
   const seek = useCallback(
     (t) => {
       dispatch({ type: 'set', patch: { playhead: t } })
-      if (engine.playing) play(t)
+      if (engine.playing && stateRef.current.mode === 'song') play(t)
     },
     [play],
   )
@@ -158,9 +240,58 @@ export default function App() {
     }
     const clip = { id: uid('c'), trackId, bufferId, name, start, offset: 0, length: buffer.duration, rate: 1, gain: 1 }
     dispatch({ type: 'setClips', record: true, clips: [...s.clips, clip] })
-    dispatch({ type: 'set', patch: { selectedClipId: clip.id, selectedTrackId: trackId } })
+    dispatch({ type: 'set', patch: { selectedClipId: clip.id, selectedTrackId: trackId, mode: 'song' } })
     return clip
   }, [])
+
+  const addPatternToPlaylist = useCallback(() => {
+    const s = stateRef.current
+    const pattern = s.patterns.find((p) => p.id === s.currentPatternId)
+    if (!pattern) return
+    const length = patternDuration(pattern, s.bpm)
+    const trackId = s.selectedTrackId
+    let start = snapTime(s.playhead, s)
+    const onTrack = s.clips.filter((c) => c.trackId === trackId)
+    if (onTrack.some((c) => c.start < start + length - 1e-6 && c.start + c.length > start + 1e-6)) {
+      start = onTrack.reduce((m, c) => Math.max(m, c.start + c.length), 0)
+    }
+    const clip = {
+      id: uid('c'),
+      trackId,
+      patternId: pattern.id,
+      bufferId: mixBufferId(pattern.id),
+      name: `▦ ${pattern.name}`,
+      start,
+      offset: 0,
+      length,
+      rate: 1,
+      gain: 1,
+    }
+    dispatch({ type: 'setClips', record: true, clips: [...s.clips, clip] })
+    dispatch({ type: 'set', patch: { selectedClipId: clip.id, playhead: start + length } })
+    notify(
+      s.mode === 'pattern'
+        ? 'Pattern liegt in der Playlist. Schalte oben auf SONG, um die Playlist abzuspielen.'
+        : 'Pattern liegt in der Playlist.',
+    )
+  }, [notify])
+
+  const loadSample = useCallback(
+    async (file) => {
+      ensureAudio()
+      try {
+        const buffer = await engine.decode(await file.arrayBuffer())
+        const id = uid('b')
+        engine.addBuffer(id, buffer)
+        const name = file.name.replace(/\.[^.]+$/, '')
+        setSamples((list) => [...list, { id, name }])
+        dispatch({ type: 'addChannel', channel: makeChannel('sample', null, name, stateRef.current.selectedTrackId, { sampleId: id }) })
+      } catch {
+        notify(`„${file.name}“ konnte nicht gelesen werden.`, 'error')
+      }
+    },
+    [ensureAudio, notify],
+  )
 
   const importFiles = useCallback(
     async (files, trackId, at) => {
@@ -178,6 +309,12 @@ export default function App() {
     },
     [addBufferClip, ensureAudio, notify],
   )
+
+  const currentPattern = state.patterns.find((p) => p.id === state.currentPatternId) ?? state.patterns[0]
+  const sampleOptions = [...samples]
+  for (const c of state.clips) {
+    if (!c.patternId && !sampleOptions.some((o) => o.id === c.bufferId)) sampleOptions.push({ id: c.bufferId, name: c.name })
+  }
 
   const selectedClip = state.clips.find((c) => c.id === state.selectedClipId) ?? null
   const selectedTrack = state.tracks.find((t) => t.id === state.selectedTrackId) ?? state.tracks[0]
@@ -239,10 +376,12 @@ export default function App() {
       ensureAudio()
       const s = stateRef.current
       // empty tracks (like the default ones) make room for the song tracks; tracks with clips stay for undo
-      const merged = s.tracks.filter((t) => s.clips.some((c) => c.trackId === t.id) || tracks.some((x) => x.id === t.id)).map((t) => {
-        const fresh = tracks.find((x) => x.id === t.id)
-        return fresh ? { ...t, fx: { ...t.fx, hp: fresh.fx.hp } } : t
-      })
+      const merged = s.tracks
+        .filter((t) => s.clips.some((c) => c.trackId === t.id) || tracks.some((x) => x.id === t.id))
+        .map((t) => {
+          const fresh = tracks.find((x) => x.id === t.id)
+          return fresh ? { ...t, fx: { ...t.fx, hp: fresh.fx.hp } } : t
+        })
       for (const t of tracks) if (!s.tracks.some((x) => x.id === t.id)) merged.push(t)
       const duration = clips.reduce((m, c) => Math.max(m, c.start + c.length), 0)
       const bar = beatSec(bpm) * 4
@@ -259,7 +398,10 @@ export default function App() {
         },
       })
       dispatch({ type: 'setClips', record: true, clips })
-      notify('Ist jetzt in der Timeline. Jeder Teil ist ein normaler Clip: verschieben, trimmen, Effekte pro Spur. Strg+Z macht es rückgängig.')
+      dispatch({ type: 'set', patch: { mode: 'song' } })
+      notify(
+        'Ist jetzt in der Timeline. Jeder Teil ist ein normaler Clip: verschieben, trimmen, Effekte pro Spur. Strg+Z macht es rückgängig.',
+      )
     },
     [ensureAudio, notify, stopTransport],
   )
@@ -273,6 +415,7 @@ export default function App() {
     if (!current) return
     recRef.current = null
     setRec(null)
+    if (current.handle.multi) return finishDesktop(current)
     const hasSignal = current.handle.hasSignal()
     const buffer = current.handle.stop()
     if (buffer && !hasSignal) {
@@ -284,6 +427,44 @@ export default function App() {
       notify('Aufnahme eingefügt. Kanten ziehen zum Trimmen, Shift = ohne Grid.')
     }
   }, [addBufferClip, notify])
+
+  // Desktop app: every recorded app goes onto its own track, all starting at the same position.
+  const finishDesktop = (current) => {
+    const results = current.handle.stop().filter((r) => r.buffer && r.buffer.duration > 0.05)
+    const withSignal = results.filter((r) => r.hasSignal)
+    if (!withSignal.length) {
+      if (results.length) notify('Die Aufnahme war stumm. Lief in den gewählten Apps gerade Ton?', 'error')
+      return
+    }
+    const s = stateRef.current
+    // each app gets a fresh track named after it, so drum/synth inserts stay untouched
+    const targets = withSignal.map((r, i) => makeTrack(s.tracks.length + i, r.label))
+    const tracks = [...s.tracks, ...targets]
+    const start = snapTime(current.startAt, s)
+    recCount.current += 1
+    const clips = withSignal.map((r, i) => {
+      const bufferId = uid('b')
+      engine.addBuffer(bufferId, r.buffer)
+      return { id: uid('c'), trackId: targets[i].id, bufferId, name: `${r.label} ${recCount.current}`, start, offset: 0, length: r.buffer.duration, rate: 1, gain: 1 }
+    })
+    dispatch({ type: 'set', patch: { tracks, mode: 'song', selectedClipId: clips[0].id, selectedTrackId: targets[0].id } })
+    dispatch({ type: 'setClips', record: true, clips: [...s.clips, ...clips] })
+    notify(clips.length > 1 ? `${clips.length} Apps aufgenommen, jede auf ihrer eigenen Spur.` : 'Aufnahme eingefügt.')
+  }
+
+  const startDesktopRec = async (sources) => {
+    setDesktopOpen(false)
+    if (recRef.current || !sources.length) return
+    try {
+      ensureAudio()
+      const handle = await startDesktopRecording(sources, { onError: (msg) => notify(msg, 'error') })
+      const s = stateRef.current
+      recRef.current = { source: 'desktop', handle, trackId: s.selectedTrackId, startAt: s.playhead }
+      setRec(recRef.current)
+    } catch (err) {
+      notify(`Aufnahme konnte nicht starten: ${err?.message || err}`, 'error')
+    }
+  }
 
   const startRec = async (source) => {
     if (recRef.current) return
@@ -302,7 +483,7 @@ export default function App() {
   const exportMix = async (mode) => {
     setExporting(true)
     try {
-      const blob = await renderProject(stateRef.current, engine.buffers, mode)
+      const blob = await renderProject(playProject(stateRef.current), engine.buffers, mode)
       const stamp = new Date().toISOString().slice(0, 16).split(/\D/).join('')
       downloadBlob(blob, `mucke-${Math.round(state.bpm)}bpm-${mode === 'loop' ? 'loop' : 'track'}-${stamp}.wav`)
     } catch (err) {
@@ -322,6 +503,12 @@ export default function App() {
       const mod = e.ctrlKey || e.metaKey
       const s = stateRef.current
       const key = e.key.toLowerCase()
+      const dock = { F6: 'rack', F7: 'piano', F8: 'fx', F9: 'mixer' }[e.key]
+      if (dock) {
+        e.preventDefault()
+        dispatch({ type: 'set', patch: { dock } })
+        return
+      }
       if (e.code === 'Space') {
         e.preventDefault()
         togglePlay()
@@ -374,7 +561,11 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-1">
-          <button className={`${btn} w-11 justify-center ${playing ? 'border-lime-400 text-lime-300' : ''}`} onClick={togglePlay} title="Play/Pause (Leertaste)">
+          <button
+            className={`${btn} w-11 justify-center ${playing ? 'border-lime-400 text-lime-300' : ''}`}
+            onClick={togglePlay}
+            title="Play/Pause (Leertaste)"
+          >
             {playing ? '❚❚' : '▶'}
           </button>
           <button className={`${btn} w-11 justify-center`} onClick={stop} title="Stopp (zurück zum Startpunkt, 2× = Anfang)">
@@ -394,6 +585,24 @@ export default function App() {
           >
             ♩ Klick
           </button>
+        </div>
+
+        <div
+          className="flex overflow-hidden rounded-md border border-zinc-700 text-xs font-bold"
+          title="PAT spielt nur das aktuelle Pattern in Schleife, SONG spielt die Playlist"
+        >
+          {[
+            ['pattern', 'PAT', 'bg-orange-400 text-zinc-900'],
+            ['song', 'SONG', 'bg-lime-400 text-zinc-900'],
+          ].map(([m, label, on]) => (
+            <button
+              key={m}
+              className={`h-9 px-3 ${state.mode === m ? on : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100'}`}
+              onClick={() => dispatch({ type: 'set', patch: { mode: m } })}
+            >
+              {label}
+            </button>
+          ))}
         </div>
 
         <PositionDisplay engine={engine} playing={playing} playhead={state.playhead} bpm={state.bpm} />
@@ -435,10 +644,18 @@ export default function App() {
         </label>
 
         <div className="flex items-center gap-1">
-          <button className={`${btn} w-9 justify-center`} onClick={() => dispatch({ type: 'set', patch: { zoom: Math.max(4, state.zoom / 1.25) } })} title="Rauszoomen (-)">
+          <button
+            className={`${btn} w-9 justify-center`}
+            onClick={() => dispatch({ type: 'set', patch: { zoom: Math.max(4, state.zoom / 1.25) } })}
+            title="Rauszoomen (-)"
+          >
             −
           </button>
-          <button className={`${btn} w-9 justify-center`} onClick={() => dispatch({ type: 'set', patch: { zoom: Math.min(1200, state.zoom * 1.25) } })} title="Reinzoomen (+)">
+          <button
+            className={`${btn} w-9 justify-center`}
+            onClick={() => dispatch({ type: 'set', patch: { zoom: Math.min(1200, state.zoom * 1.25) } })}
+            title="Reinzoomen (+)"
+          >
             +
           </button>
         </div>
@@ -447,7 +664,12 @@ export default function App() {
           <button className={btn} onClick={() => dispatch({ type: 'undo' })} disabled={!state.past.length} title="Rückgängig (Strg+Z)">
             ↶
           </button>
-          <button className={btn} onClick={() => dispatch({ type: 'redo' })} disabled={!state.future.length} title="Wiederholen (Strg+Shift+Z)">
+          <button
+            className={btn}
+            onClick={() => dispatch({ type: 'redo' })}
+            disabled={!state.future.length}
+            title="Wiederholen (Strg+Shift+Z)"
+          >
             ↷
           </button>
         </div>
@@ -459,14 +681,26 @@ export default function App() {
               REC <RecTimer handle={rec.handle} />
               <SilenceHint handle={rec.handle} />
               <LevelMeter read={readRec} className="w-16" />
-              <button className="ml-1 rounded bg-rose-500 px-2 py-0.5 text-xs font-semibold text-white hover:bg-rose-400" onClick={finishRecording}>
+              <button
+                className="ml-1 rounded bg-rose-500 px-2 py-0.5 text-xs font-semibold text-white hover:bg-rose-400"
+                onClick={finishRecording}
+              >
                 Stopp
               </button>
             </div>
           ) : (
             <>
+              {isDesktop && (
+                <button
+                  className={`${btn} border-rose-500 bg-rose-500/10 text-rose-100 hover:border-rose-300`}
+                  onClick={() => setDesktopOpen(true)}
+                  title="Ton einzelner Programme (z. B. Spotify) oder des ganzen Desktops aufnehmen"
+                >
+                  <span className="h-2.5 w-2.5 rounded-full bg-rose-500" /> Desktop / Apps
+                </button>
+              )}
               <button
-                className={`${btn} border-rose-500/60 text-rose-200 hover:border-rose-400`}
+                className={`${btn} border-rose-500/60 text-rose-200 hover:border-rose-400 ${isDesktop ? 'hidden' : ''}`}
                 onClick={() => startRec('display')}
                 disabled={!displayCaptureSupported()}
                 title="Tab- oder System-Audio aufnehmen (Chrome/Edge: im Dialog „Tab-Audio teilen“ anhaken)"
@@ -503,15 +737,15 @@ export default function App() {
             <button
               className={`${btn} rounded-r-none border-cyan-500/70 bg-cyan-500/10 text-cyan-100`}
               onClick={() => exportMix('song')}
-              disabled={exporting || !state.clips.length}
-              title="Ganzen Track als WAV herunterladen"
+              disabled={exporting || (state.mode === 'song' && !state.clips.length)}
+              title={state.mode === 'pattern' ? 'Aktuelles Pattern als WAV herunterladen' : 'Ganzen Track als WAV herunterladen'}
             >
               {exporting ? '…' : '⬇'} Track WAV
             </button>
             <button
               className={`${btn} -ml-px rounded-l-none border-cyan-500/70 bg-cyan-500/10 text-cyan-100`}
               onClick={() => exportMix('loop')}
-              disabled={exporting || !state.clips.length || state.loop.end <= state.loop.start}
+              disabled={exporting || (state.mode === 'song' && (!state.clips.length || state.loop.end <= state.loop.start))}
               title="Nur den Loop-Bereich exportieren (nahtlos loopbar)"
             >
               Loop
@@ -524,7 +758,15 @@ export default function App() {
         <div className="flex">
           <TrackHeaders state={state} dispatch={dispatch} />
           <div className="min-w-0 flex-1">
-            <Timeline state={state} dispatch={dispatch} engine={engine} playing={playing} onSeek={seek} onDropFiles={importFiles} />
+            <Timeline
+              state={state}
+              dispatch={dispatch}
+              engine={engine}
+              playing={playing && state.mode === 'song'}
+              renderTick={renderTick}
+              onSeek={seek}
+              onDropFiles={importFiles}
+            />
           </div>
         </div>
         <p className="px-4 py-3 text-xs leading-relaxed text-zinc-500">
@@ -534,47 +776,96 @@ export default function App() {
         </p>
       </main>
 
-      <footer className="flex flex-col gap-4 border-t border-zinc-800 bg-zinc-950 px-4 py-3 xl:flex-row">
-        <div className="min-w-0 flex-1 overflow-x-auto">
-          <FxPanel track={selectedTrack} dispatch={dispatch} />
-        </div>
-        <div className="flex gap-4 xl:w-[26rem]">
-          <div className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-            <ClipInspector
-              key={selectedClip?.id}
-              clip={selectedClip}
-              state={state}
-              bufferDuration={selectedClip ? engine.buffers.get(selectedClip.bufferId)?.duration ?? 0 : 0}
-              onUpdate={(patch, record) => updateClip(selectedClip.id, patch, record)}
-              onSplit={splitAtPlayhead}
-              onDuplicate={duplicateSelected}
-              onLoopClip={loopSelected}
-              onDelete={deleteSelected}
-            />
-          </div>
-          <div className="flex flex-col items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-zinc-500">Master</div>
-            <Knob
-              label="Volume"
-              value={state.master.volume}
-              min={0}
-              max={1.5}
-              defaultValue={0.9}
-              color="#22d3ee"
-              format={(v) => `${Math.round(v * 100)}%`}
-              onChange={(v) => dispatch({ type: 'set', patch: { master: { ...state.master, volume: v } } })}
-            />
-            <LevelMeter read={readMaster} className="w-16" />
+      <section className="max-h-[55vh] shrink-0 overflow-y-auto border-t border-zinc-800 bg-zinc-950">
+        <div className="sticky top-0 z-20 flex items-center gap-1 border-b border-zinc-800 bg-zinc-950 px-4 pt-2">
+          {DOCKS.map((d) => (
             <button
-              className={`mt-1 rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${state.master.limiter ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-400'}`}
-              onClick={() => dispatch({ type: 'set', patch: { master: { ...state.master, limiter: !state.master.limiter } } })}
-              title="Limiter verhindert Clipping im Export"
+              key={d.id}
+              className={`rounded-t-md border border-b-0 px-3 py-1.5 text-xs font-semibold ${
+                state.dock === d.id ? 'border-zinc-600 bg-zinc-800 text-zinc-100' : 'border-transparent text-zinc-500 hover:text-zinc-200'
+              }`}
+              onClick={() => dispatch({ type: 'set', patch: { dock: d.id } })}
+              title={`Taste ${d.key}`}
             >
-              Limiter
+              {d.label} <span className="font-mono text-[9px] text-zinc-500">{d.key}</span>
             </button>
-          </div>
+          ))}
+          <input
+            ref={sampleInput}
+            type="file"
+            accept="audio/*"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files[0]
+              if (f) loadSample(f)
+              e.target.value = ''
+            }}
+          />
         </div>
-      </footer>
+        <div className="px-4 py-3">
+          {state.dock === 'rack' && (
+            <ChannelRack
+              state={state}
+              dispatch={dispatch}
+              engine={engine}
+              playing={playing}
+              pattern={currentPattern}
+              sampleOptions={sampleOptions}
+              onLoadSample={() => sampleInput.current.click()}
+              onAddToPlaylist={addPatternToPlaylist}
+            />
+          )}
+          {state.dock === 'piano' && (
+            <PianoRoll state={state} dispatch={dispatch} engine={engine} playing={playing} pattern={currentPattern} />
+          )}
+          {state.dock === 'mixer' && <Mixer state={state} dispatch={dispatch} engine={engine} />}
+          {state.dock === 'fx' && (
+            <div className="flex flex-col gap-4 xl:flex-row">
+              <div className="min-w-0 flex-1 overflow-x-auto">
+                <FxPanel track={selectedTrack} dispatch={dispatch} />
+              </div>
+              <div className="flex gap-4 xl:w-[26rem]">
+                <div className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+                  <ClipInspector
+                    key={selectedClip?.id}
+                    clip={selectedClip}
+                    state={state}
+                    bufferDuration={selectedClip ? (engine.buffers.get(selectedClip.bufferId)?.duration ?? 0) : 0}
+                    onUpdate={(patch, record) => updateClip(selectedClip.id, patch, record)}
+                    onSplit={splitAtPlayhead}
+                    onDuplicate={duplicateSelected}
+                    onLoopClip={loopSelected}
+                    onDelete={deleteSelected}
+                  />
+                </div>
+                <div className="flex flex-col items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.2em] text-zinc-500">Master</div>
+                  <Knob
+                    label="Volume"
+                    value={state.master.volume}
+                    min={0}
+                    max={1.5}
+                    defaultValue={0.9}
+                    color="#22d3ee"
+                    format={(v) => `${Math.round(v * 100)}%`}
+                    onChange={(v) => dispatch({ type: 'set', patch: { master: { ...state.master, volume: v } } })}
+                  />
+                  <LevelMeter read={readMaster} className="w-16" />
+                  <button
+                    className={`mt-1 rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${state.master.limiter ? 'bg-cyan-400 text-zinc-900' : 'bg-zinc-800 text-zinc-400'}`}
+                    onClick={() => dispatch({ type: 'set', patch: { master: { ...state.master, limiter: !state.master.limiter } } })}
+                    title="Limiter verhindert Clipping im Export"
+                  >
+                    Limiter
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {isDesktop && <DesktopRecordDialog open={desktopOpen} onClose={() => setDesktopOpen(false)} onStart={startDesktopRec} notify={notify} />}
 
       <MashupStudio
         open={mashupOpen}

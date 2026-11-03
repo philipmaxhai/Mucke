@@ -1,6 +1,7 @@
 import { createFxChain, createMaster, trackAudible } from './fx.js'
 import { schedulePart, songEnd } from './schedule.js'
 import { encodeWav } from './wav.js'
+import { expandClips } from './patterns.js'
 
 const EXPORT_RATE = 44100
 
@@ -32,7 +33,7 @@ export async function renderProject(project, buffers, mode) {
     chains.set(t.id, chain)
   }
 
-  for (const clip of clips) {
+  for (const clip of expandClips(clips, project.channels ?? [])) {
     const buffer = buffers.get(clip.bufferId)
     const chain = chains.get(clip.trackId)
     if (!buffer || !chain) continue
