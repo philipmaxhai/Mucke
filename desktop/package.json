@@ -1,0 +1,25 @@
+{
+  "name": "mucke-desktop",
+  "productName": "Mucke",
+  "version": "0.2.0",
+  "description": "Mucke DAW als Windows-App mit Aufnahme einzelner Apps",
+  "main": "main.cjs",
+  "private": true,
+  "scripts": {
+    "copy-web": "node -e \"require('fs').cpSync('../dist','app',{recursive:true})\"",
+    "start": "electron .",
+    "dist": "npm run copy-web && electron-builder --win portable zip --x64"
+  },
+  "devDependencies": {
+    "electron": "33.2.1",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "io.github.philipmaxhai.mucke",
+    "productName": "Mucke",
+    "files": ["main.cjs", "preload.cjs", "app/**/*"],
+    "extraResources": [{ "from": "native/mucke-loopback.exe", "to": "mucke-loopback.exe" }],
+    "win": { "artifactName": "Mucke-${version}-${arch}.${ext}" },
+    "portable": { "artifactName": "Mucke-${version}-portable.exe" }
+  }
+}

@@ -10,11 +10,13 @@ import Mixer from './components/Mixer.jsx'
 import PianoRoll from './components/PianoRoll.jsx'
 import FxPanel from './components/FxPanel.jsx'
 import Knob from './components/Knob.jsx'
+import DesktopRecordDialog from './components/DesktopRecordDialog.jsx'
 import MashupStudio from './components/MashupStudio.jsx'
+import { desktopApi, startDesktopRecording } from './audio/desktop.js'
 import { LevelMeter, PositionDisplay, RecTimer, SilenceHint } from './components/Meters.jsx'
 import Timeline from './components/Timeline.jsx'
 import TrackHeaders from './components/TrackHeaders.jsx'
-import { SNAP_OPTIONS, beatSec, initialState, makeChannel, reducer, snapTime, splitClip, uid } from './state/project.js'
+import { SNAP_OPTIONS, beatSec, initialState, makeChannel, makeTrack, reducer, snapTime, splitClip, uid } from './state/project.js'
 
 const DOCKS = [
   { id: 'rack', label: 'Channel Rack', key: 'F6' },
@@ -73,6 +75,8 @@ export default function App() {
   const [toast, setToast] = useState(null)
   const [exporting, setExporting] = useState(false)
   const [mashupOpen, setMashupOpen] = useState(false)
+  const [desktopOpen, setDesktopOpen] = useState(false)
+  const isDesktop = !!desktopApi()
   const mashupOpenRef = useRef(false)
   mashupOpenRef.current = mashupOpen
   const playingRef = useRef(false)
@@ -411,6 +415,7 @@ export default function App() {
     if (!current) return
     recRef.current = null
     setRec(null)
+    if (current.handle.multi) return finishDesktop(current)
     const hasSignal = current.handle.hasSignal()
     const buffer = current.handle.stop()
     if (buffer && !hasSignal) {
@@ -422,6 +427,44 @@ export default function App() {
       notify('Aufnahme eingefügt. Kanten ziehen zum Trimmen, Shift = ohne Grid.')
     }
   }, [addBufferClip, notify])
+
+  // Desktop app: every recorded app goes onto its own track, all starting at the same position.
+  const finishDesktop = (current) => {
+    const results = current.handle.stop().filter((r) => r.buffer && r.buffer.duration > 0.05)
+    const withSignal = results.filter((r) => r.hasSignal)
+    if (!withSignal.length) {
+      if (results.length) notify('Die Aufnahme war stumm. Lief in den gewählten Apps gerade Ton?', 'error')
+      return
+    }
+    const s = stateRef.current
+    // each app gets a fresh track named after it, so drum/synth inserts stay untouched
+    const targets = withSignal.map((r, i) => makeTrack(s.tracks.length + i, r.label))
+    const tracks = [...s.tracks, ...targets]
+    const start = snapTime(current.startAt, s)
+    recCount.current += 1
+    const clips = withSignal.map((r, i) => {
+      const bufferId = uid('b')
+      engine.addBuffer(bufferId, r.buffer)
+      return { id: uid('c'), trackId: targets[i].id, bufferId, name: `${r.label} ${recCount.current}`, start, offset: 0, length: r.buffer.duration, rate: 1, gain: 1 }
+    })
+    dispatch({ type: 'set', patch: { tracks, mode: 'song', selectedClipId: clips[0].id, selectedTrackId: targets[0].id } })
+    dispatch({ type: 'setClips', record: true, clips: [...s.clips, ...clips] })
+    notify(clips.length > 1 ? `${clips.length} Apps aufgenommen, jede auf ihrer eigenen Spur.` : 'Aufnahme eingefügt.')
+  }
+
+  const startDesktopRec = async (sources) => {
+    setDesktopOpen(false)
+    if (recRef.current || !sources.length) return
+    try {
+      ensureAudio()
+      const handle = await startDesktopRecording(sources, { onError: (msg) => notify(msg, 'error') })
+      const s = stateRef.current
+      recRef.current = { source: 'desktop', handle, trackId: s.selectedTrackId, startAt: s.playhead }
+      setRec(recRef.current)
+    } catch (err) {
+      notify(`Aufnahme konnte nicht starten: ${err?.message || err}`, 'error')
+    }
+  }
 
   const startRec = async (source) => {
     if (recRef.current) return
@@ -647,8 +690,17 @@ export default function App() {
             </div>
           ) : (
             <>
+              {isDesktop && (
+                <button
+                  className={`${btn} border-rose-500 bg-rose-500/10 text-rose-100 hover:border-rose-300`}
+                  onClick={() => setDesktopOpen(true)}
+                  title="Ton einzelner Programme (z. B. Spotify) oder des ganzen Desktops aufnehmen"
+                >
+                  <span className="h-2.5 w-2.5 rounded-full bg-rose-500" /> Desktop / Apps
+                </button>
+              )}
               <button
-                className={`${btn} border-rose-500/60 text-rose-200 hover:border-rose-400`}
+                className={`${btn} border-rose-500/60 text-rose-200 hover:border-rose-400 ${isDesktop ? 'hidden' : ''}`}
                 onClick={() => startRec('display')}
                 disabled={!displayCaptureSupported()}
                 title="Tab- oder System-Audio aufnehmen (Chrome/Edge: im Dialog „Tab-Audio teilen“ anhaken)"
@@ -812,6 +864,8 @@ export default function App() {
           )}
         </div>
       </section>
+
+      {isDesktop && <DesktopRecordDialog open={desktopOpen} onClose={() => setDesktopOpen(false)} onStart={startDesktopRec} notify={notify} />}
 
       <MashupStudio
         open={mashupOpen}

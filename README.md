@@ -28,6 +28,34 @@ npm run build    # statischer Build in dist/
 - **Tap-Tempo**, Metronom, Undo/Redo.
 - **Export**: ganzer Track oder exakt der Loop-Bereich als 16-Bit-WAV (44,1 kHz), gerendert durch dieselbe FX-Kette.
 
+## FL-Studio-Workflow
+
+- **PAT / SONG** oben in der Leiste: PAT spielt nur das aktuelle Pattern in Schleife, SONG spielt die Playlist (die Timeline).
+- **Channel Rack (F6)**: Step-Sequencer mit eingebauten Drums (Kick, Clap, Snare, Hats, Perc), Synths (Bass, Lead, Pluck, Pad, House-Orgel)
+  und Sampler (Audiodatei oder ein Clip aus der Timeline). Pro Kanal Volume, Pan, Tonhöhe, Mute/Solo und Ziel-Insert im Mixer.
+  Patterns mit 1–8 Takten, Swing, Klonen. „In Playlist“ legt das Pattern an die Playhead-Position.
+- **Piano Roll (F7)**: Noten pro Kanal und Pattern setzen, verschieben, Länge ziehen, Rechtsklick löscht.
+- **Mixer (F9)**: Insert-Kanäle mit Fader, Pan, Pegelanzeige, Mute/Solo und Effekt-Slots (Filter, EQ, Delay), plus Master mit Limiter.
+- **Clip & FX (F8)**: die bisherige Effekt- und Clip-Ansicht.
+
+## Windows-App: Spotify & andere Programme einzeln aufnehmen
+
+Im Browser geht nur Tab-Audio. Die Windows-App (`desktop/`, Electron) nimmt den Ton einzelner Programme auf, z. B. nur Spotify,
+und jedes Programm landet auf einer eigenen Spur. Alternativ „Ganzer Desktop (ohne Mucke)“. Apps lassen sich im Dialog außerdem
+im Windows-Lautstärkemixer stummschalten.
+
+- Technik: WASAPI-Prozess-Loopback (dieselbe Windows-Schnittstelle wie „Anwendungsaudioaufnahme“ in OBS), ab Windows 10 Version 2004.
+  Aufgenommen wird nur, was die App ohnehin an die Lautsprecher schickt; es wird kein Kopierschutz umgangen.
+- **Download**: GitHub → Actions → „Windows desktop app“ → letzter Lauf → Artifact „Mucke-Windows“ (portable `.exe` und `.zip`).
+  Die App ist nicht signiert, Windows SmartScreen fragt deshalb beim ersten Start nach („Weitere Informationen“ → „Trotzdem ausführen“).
+- Selbst bauen (Windows, Node 22, Visual Studio Build Tools):
+  ```bash
+  npm ci && npm run build
+  cd desktop/native && cl /O2 /EHsc /std:c++17 /MT mucke-loopback.cpp ole32.lib mmdevapi.lib uuid.lib psapi.lib /Fe:mucke-loopback.exe
+  cd .. && npm install && npm run dist      # Ergebnis in desktop/dist/
+  ```
+- Rechtliches: Spotify verbietet Mitschnitte in den Nutzungsbedingungen. Nur für den rein privaten Gebrauch.
+
 ## Tab-Audio aufnehmen – Browser-Hinweise
 
 - Funktioniert in **Chrome, Edge, Brave, Opera** (Chromium). Firefox und Safari liefern bei Bildschirmfreigabe kein Audio.
