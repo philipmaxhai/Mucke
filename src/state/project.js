@@ -1,4 +1,5 @@
 import { DEFAULT_FX } from '../audio/fx.js'
+import { STEPS_PER_BAR } from '../audio/patterns.js'
 
 export const TRACK_COLORS = ['#22d3ee', '#e879f9', '#a3e635', '#fb923c', '#f43f5e', '#818cf8', '#facc15', '#2dd4bf']
 
@@ -25,10 +26,58 @@ export function makeTrack(index, name) {
   }
 }
 
+export const PATTERN_COLORS = ['#fb923c', '#a3e635', '#22d3ee', '#e879f9', '#facc15', '#f43f5e', '#818cf8', '#2dd4bf']
+
+export function makeChannel(kind, preset, name, insertId, extra = {}) {
+  return { id: uid('ch'), kind, preset, name, insertId, volume: 0.8, pan: 0, pitch: 0, mute: false, solo: false, ...extra }
+}
+
+export function makePattern(index, bars = 1) {
+  return {
+    id: uid('p'),
+    name: `Pattern ${index + 1}`,
+    color: PATTERN_COLORS[index % PATTERN_COLORS.length],
+    bars,
+    swing: 0,
+    steps: {},
+    notes: {},
+  }
+}
+
+const hits = (list, len = STEPS_PER_BAR) => Array.from({ length: len }, (_, i) => (list.includes(i) ? 1 : 0))
+
+function defaultRack(tracks) {
+  const [drums, bass, , fx, synth] = tracks
+  const channels = [
+    makeChannel('drum', 'kick', 'Kick', drums.id),
+    makeChannel('drum', 'clap', 'Clap', drums.id),
+    makeChannel('drum', 'hat', 'Hi-Hat', drums.id, { volume: 0.6 }),
+    makeChannel('drum', 'openhat', 'Open Hat', drums.id, { volume: 0.55 }),
+    makeChannel('drum', 'rim', 'Perc', fx.id, { volume: 0.5 }),
+    makeChannel('synth', 'bass', 'Bass', bass.id, { root: 33 }),
+    makeChannel('synth', 'organ', 'House-Orgel', synth.id, { root: 57, volume: 0.7 }),
+  ]
+  const [kick, clap, hat, ohat, , bassCh] = channels
+  const p = makePattern(0)
+  p.name = 'Beat'
+  p.steps = {
+    [kick.id]: hits([0, 4, 8, 12]),
+    [clap.id]: hits([4, 12]),
+    [hat.id]: hits([2, 6, 10, 14]),
+    [ohat.id]: hits([]),
+  }
+  p.notes = { [bassCh.id]: [2, 6, 10, 14].map((s) => ({ id: uid('n'), p: 33, s, l: 2, v: 0.85 })) }
+  return { channels, patterns: [p], currentPatternId: p.id }
+}
+
 export function initialState() {
-  const tracks = ['Drums', 'Bass', 'Vocals', 'FX'].map((n, i) => makeTrack(i, n))
+  const tracks = ['Drums', 'Bass', 'Vocals', 'FX', 'Synth'].map((n, i) => makeTrack(i, n))
   const bar = (60 / 124) * 4
   return {
+    ...defaultRack(tracks),
+    mode: 'pattern', // 'pattern' loops the current pattern, 'song' plays the playlist (like FL's PAT/SONG)
+    dock: 'rack', // which window is open at the bottom: rack | piano | mixer | fx
+    pianoChannelId: null,
     bpm: 124,
     snap: 1,
     zoom: 60, // pixels per second
@@ -86,6 +135,47 @@ export function reducer(state, a) {
       const track = makeTrack(state.tracks.length)
       return { ...state, tracks: [...state.tracks, track], selectedTrackId: track.id }
     }
+    case 'updateChannel':
+      return { ...state, channels: state.channels.map((c) => (c.id === a.id ? { ...c, ...a.patch } : c)) }
+    case 'addChannel':
+      return { ...state, channels: [...state.channels, a.channel] }
+    case 'removeChannel':
+      return {
+        ...state,
+        channels: state.channels.filter((c) => c.id !== a.id),
+        pianoChannelId: state.pianoChannelId === a.id ? null : state.pianoChannelId,
+      }
+    case 'updatePattern':
+      return { ...state, patterns: state.patterns.map((p) => (p.id === a.id ? { ...p, ...a.patch } : p)) }
+    case 'setSteps':
+      return {
+        ...state,
+        patterns: state.patterns.map((p) => (p.id === a.id ? { ...p, steps: { ...p.steps, [a.channelId]: a.steps } } : p)),
+      }
+    case 'setNotes':
+      return {
+        ...state,
+        patterns: state.patterns.map((p) => (p.id === a.id ? { ...p, notes: { ...p.notes, [a.channelId]: a.notes } } : p)),
+      }
+    case 'addPattern': {
+      const src = a.cloneOf && state.patterns.find((p) => p.id === a.cloneOf)
+      const p = makePattern(state.patterns.length, src?.bars ?? 1)
+      if (src)
+        Object.assign(p, { bars: src.bars, swing: src.swing, steps: { ...src.steps }, notes: { ...src.notes }, name: `${src.name} 2` })
+      return { ...state, patterns: [...state.patterns, p], currentPatternId: p.id }
+    }
+    case 'removePattern': {
+      if (state.patterns.length <= 1) return state
+      const patterns = state.patterns.filter((p) => p.id !== a.id)
+      const clips = state.clips.filter((c) => c.patternId !== a.id)
+      return {
+        ...state,
+        patterns,
+        clips,
+        past: clips.length !== state.clips.length ? [...state.past, state.clips].slice(-HISTORY) : state.past,
+        currentPatternId: state.currentPatternId === a.id ? patterns[0].id : state.currentPatternId,
+      }
+    }
     case 'removeTrack': {
       if (state.tracks.length <= 1) return state
       const tracks = state.tracks.filter((t) => t.id !== a.id)
@@ -95,6 +185,7 @@ export function reducer(state, a) {
         tracks,
         clips,
         past: clips.length !== state.clips.length ? [...state.past, state.clips].slice(-HISTORY) : state.past,
+        channels: state.channels.map((c) => (c.insertId === a.id ? { ...c, insertId: tracks[0].id } : c)),
         selectedTrackId: state.selectedTrackId === a.id ? tracks[0].id : state.selectedTrackId,
       }
     }

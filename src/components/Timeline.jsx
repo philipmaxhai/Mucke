@@ -13,7 +13,7 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.roundRect(x, y, w, h, r)
 }
 
-export default function Timeline({ state, dispatch, engine, playing, onSeek, onDropFiles }) {
+export default function Timeline({ state, dispatch, engine, playing, renderTick, onSeek, onDropFiles }) {
   const scrollRef = useRef(null)
   const canvasRef = useRef(null)
   const playheadRef = useRef(null)
@@ -195,7 +195,7 @@ export default function Timeline({ state, dispatch, engine, playing, onSeek, onD
 
   useEffect(() => {
     draw()
-  }, [draw, state, width])
+  }, [draw, state, width, renderTick])
 
   useLayoutEffect(() => {
     if (pendingScroll.current !== null && scrollRef.current) {
@@ -394,7 +394,9 @@ export default function Timeline({ state, dispatch, engine, playing, onSeek, onD
 
   const onDrop = (e) => {
     e.preventDefault()
-    const files = [...e.dataTransfer.files].filter((f) => f.type.startsWith('audio/') || /\.(wav|mp3|ogg|flac|m4a|aac|aiff?)$/i.test(f.name))
+    const files = [...e.dataTransfer.files].filter(
+      (f) => f.type.startsWith('audio/') || /\.(wav|mp3|ogg|flac|m4a|aac|aiff?)$/i.test(f.name),
+    )
     if (!files.length) return
     const s = stateRef.current
     const { x, y, t } = locate(e)
